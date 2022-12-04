@@ -1,88 +1,166 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 
+	"github.com/mattermost/mattermost-server/v6/app/request"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitSharedChannels() {
-	api.BaseRoutes.SharedChannels.Handle("/{team_id:[A-Za-z0-9]+}", api.APISessionRequired(getSharedChannels)).Methods("GET")
-	api.BaseRoutes.SharedChannels.Handle("/remote_info/{remote_id:[A-Za-z0-9]+}", api.APISessionRequired(getRemoteClusterInfo)).Methods("GET")
+func (a *App) checkChannelNotShared(c request.CTX, channelId string) error {
+	// check that channel exists.
+	if _, err := a.GetChannel(c, channelId); err != nil {
+		return fmt.Errorf("cannot share this channel: %w", err)
+	}
+
+	// Check channel is not already shared.
+	if _, err := a.GetSharedChannel(channelId); err == nil {
+		var errNotFound *store.ErrNotFound
+		if errors.As(err, &errNotFound) {
+			return fmt.Errorf("channel is already shared: %w", err)
+		}
+		return fmt.Errorf("cannot find channel: %w", err)
+	}
+	return nil
 }
 
-func getSharedChannels(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
+func (a *App) checkChannelIsShared(channelId string) error {
+	if _, err := a.GetSharedChannel(channelId); err != nil {
+		var errNotFound *store.ErrNotFound
+		if errors.As(err, &errNotFound) {
+			return fmt.Errorf("channel is not shared: %w", err)
+		}
+		return fmt.Errorf("cannot find channel: %w", err)
 	}
-
-	// make sure remote cluster service is enabled.
-	if _, appErr := c.App.GetRemoteClusterService(); appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	// make sure user has access to the team.
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	opts := model.SharedChannelFilterOpts{
-		TeamId: c.Params.TeamId,
-	}
-
-	// only return channels the user is a member of, unless they are a shared channels manager.
-	if !c.App.HasPermissionTo(c.AppContext.Session().UserId, model.PermissionManageSharedChannels) {
-		opts.MemberId = c.AppContext.Session().UserId
-	}
-
-	channels, appErr := c.App.GetSharedChannels(c.Params.Page, c.Params.PerPage, opts)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(channels)
-	if err != nil {
-		c.SetJSONEncodingError(err)
-		return
-	}
-
-	w.Write(b)
+	return nil
 }
 
-func getRemoteClusterInfo(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireRemoteId()
-	if c.Err != nil {
-		return
-	}
-
-	// make sure remote cluster service is enabled.
-	if _, appErr := c.App.GetRemoteClusterService(); appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	// GetRemoteClusterForUser will only return a remote if the user is a member of at
-	// least one channel shared by the remote. All other cases return error.
-	rc, appErr := c.App.GetRemoteClusterForUser(c.Params.RemoteId, c.AppContext.Session().UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	remoteInfo := rc.ToRemoteClusterInfo()
-
-	b, err := json.Marshal(remoteInfo)
+func (a *App) CheckCanInviteToSharedChannel(channelId string) error {
+	sc, err := a.GetSharedChannel(channelId)
 	if err != nil {
-		c.SetJSONEncodingError(err)
+		var errNotFound *store.ErrNotFound
+		if errors.As(err, &errNotFound) {
+			return fmt.Errorf("channel is not shared: %w", err)
+		}
+		return fmt.Errorf("cannot find channel: %w", err)
+	}
+
+	if !sc.Home {
+		return errors.New("channel is homed on a remote cluster")
+	}
+	return nil
+}
+
+// SharedChannels
+
+func (a *App) SaveSharedChannel(c request.CTX, sc *model.SharedChannel) (*model.SharedChannel, error) {
+	if err := a.checkChannelNotShared(c, sc.ChannelId); err != nil {
+		return nil, err
+	}
+	return a.Srv().Store().SharedChannel().Save(sc)
+}
+
+func (a *App) GetSharedChannel(channelID string) (*model.SharedChannel, error) {
+	return a.Srv().Store().SharedChannel().Get(channelID)
+}
+
+func (a *App) HasSharedChannel(channelID string) (bool, error) {
+	return a.Srv().Store().SharedChannel().HasChannel(channelID)
+}
+
+func (a *App) GetSharedChannels(page int, perPage int, opts model.SharedChannelFilterOpts) ([]*model.SharedChannel, *model.AppError) {
+	channels, err := a.Srv().Store().SharedChannel().GetAll(page*perPage, perPage, opts)
+	if err != nil {
+		return nil, model.NewAppError("GetSharedChannels", "app.channel.get_channels.not_found.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return channels, nil
+}
+
+func (a *App) GetSharedChannelsCount(opts model.SharedChannelFilterOpts) (int64, error) {
+	return a.Srv().Store().SharedChannel().GetAllCount(opts)
+}
+
+func (a *App) UpdateSharedChannel(sc *model.SharedChannel) (*model.SharedChannel, error) {
+	return a.Srv().Store().SharedChannel().Update(sc)
+}
+
+func (a *App) DeleteSharedChannel(channelID string) (bool, error) {
+	return a.Srv().Store().SharedChannel().Delete(channelID)
+}
+
+// SharedChannelRemotes
+
+func (a *App) SaveSharedChannelRemote(remote *model.SharedChannelRemote) (*model.SharedChannelRemote, error) {
+	if err := a.checkChannelIsShared(remote.ChannelId); err != nil {
+		return nil, err
+	}
+	return a.Srv().Store().SharedChannel().SaveRemote(remote)
+}
+
+func (a *App) GetSharedChannelRemote(id string) (*model.SharedChannelRemote, error) {
+	return a.Srv().Store().SharedChannel().GetRemote(id)
+}
+
+func (a *App) GetSharedChannelRemoteByIds(channelID string, remoteID string) (*model.SharedChannelRemote, error) {
+	return a.Srv().Store().SharedChannel().GetRemoteByIds(channelID, remoteID)
+}
+
+func (a *App) GetSharedChannelRemotes(opts model.SharedChannelRemoteFilterOpts) ([]*model.SharedChannelRemote, error) {
+	return a.Srv().Store().SharedChannel().GetRemotes(opts)
+}
+
+// HasRemote returns whether a given channelID is present in the channel remotes or not.
+func (a *App) HasRemote(channelID string, remoteID string) (bool, error) {
+	return a.Srv().Store().SharedChannel().HasRemote(channelID, remoteID)
+}
+
+func (a *App) GetRemoteClusterForUser(remoteID string, userID string) (*model.RemoteCluster, *model.AppError) {
+	rc, err := a.Srv().Store().SharedChannel().GetRemoteForUser(remoteID, userID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetRemoteClusterForUser", "api.context.remote_id_invalid.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetRemoteClusterForUser", "api.context.remote_id_invalid.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+	return rc, nil
+}
+
+func (a *App) UpdateSharedChannelRemoteCursor(id string, cursor model.GetPostsSinceForSyncCursor) error {
+	return a.Srv().Store().SharedChannel().UpdateRemoteCursor(id, cursor)
+}
+
+func (a *App) DeleteSharedChannelRemote(id string) (bool, error) {
+	return a.Srv().Store().SharedChannel().DeleteRemote(id)
+}
+
+func (a *App) GetSharedChannelRemotesStatus(channelID string) ([]*model.SharedChannelRemoteStatus, error) {
+	if err := a.checkChannelIsShared(channelID); err != nil {
+		return nil, err
+	}
+	return a.Srv().Store().SharedChannel().GetRemotesStatus(channelID)
+}
+
+// SharedChannelUsers
+
+func (a *App) NotifySharedChannelUserUpdate(user *model.User) {
+	a.sendUpdatedUserEvent(*user)
+}
+
+// onUserProfileChange is called when a user's profile has changed
+// (username, email, profile image, ...)
+func (a *App) onUserProfileChange(userID string) {
+	syncService := a.Srv().GetSharedChannelSyncService()
+	if syncService == nil || !syncService.Active() {
 		return
 	}
-	w.Write(b)
+	syncService.NotifyUserProfileChanged(userID)
 }

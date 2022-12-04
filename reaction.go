@@ -1,141 +1,171 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
+	"github.com/mattermost/mattermost-server/v6/app/request"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/plugin"
 	"github.com/mattermost/mattermost-server/v6/shared/mlog"
 )
 
-func (api *API) InitReaction() {
-	api.BaseRoutes.Reactions.Handle("", api.APISessionRequired(saveReaction)).Methods("POST")
-	api.BaseRoutes.Post.Handle("/reactions", api.APISessionRequired(getReactions)).Methods("GET")
-	api.BaseRoutes.ReactionByNameForPostForUser.Handle("", api.APISessionRequired(deleteReaction)).Methods("DELETE")
-	api.BaseRoutes.Posts.Handle("/ids/reactions", api.APISessionRequired(getBulkReactions)).Methods("POST")
-}
-
-func saveReaction(c *Context, w http.ResponseWriter, r *http.Request) {
-	var reaction model.Reaction
-	if jsonErr := json.NewDecoder(r.Body).Decode(&reaction); jsonErr != nil {
-		c.SetInvalidParamWithErr("reaction", jsonErr)
-		return
-	}
-
-	if !model.IsValidId(reaction.UserId) || !model.IsValidId(reaction.PostId) || reaction.EmojiName == "" || len(reaction.EmojiName) > model.EmojiNameMaxLength {
-		c.Err = model.NewAppError("saveReaction", "api.reaction.save_reaction.invalid.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if reaction.UserId != c.AppContext.Session().UserId {
-		c.Err = model.NewAppError("saveReaction", "api.reaction.save_reaction.user_id.app_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	if !c.App.SessionHasPermissionToChannelByPost(*c.AppContext.Session(), reaction.PostId, model.PermissionAddReaction) {
-		c.SetPermissionError(model.PermissionAddReaction)
-		return
-	}
-
-	re, err := c.App.SaveReactionForPost(c.AppContext, &reaction)
+func (a *App) SaveReactionForPost(c *request.Context, reaction *model.Reaction) (*model.Reaction, *model.AppError) {
+	post, err := a.GetSinglePost(reaction.PostId, false)
 	if err != nil {
-		c.Err = err
-		return
+		return nil, err
 	}
 
-	if err := json.NewEncoder(w).Encode(re); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getReactions(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequirePostId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToChannelByPost(*c.AppContext.Session(), c.Params.PostId, model.PermissionReadChannel) {
-		c.SetPermissionError(model.PermissionReadChannel)
-		return
-	}
-
-	reactions, appErr := c.App.GetReactionsForPost(c.Params.PostId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(reactions)
+	channel, err := a.GetChannel(c, post.ChannelId)
 	if err != nil {
-		c.Err = model.NewAppError("getReactions", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return nil, err
 	}
 
-	w.Write(js)
-}
-
-func deleteReaction(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireUserId()
-	if c.Err != nil {
-		return
+	if channel.DeleteAt > 0 {
+		return nil, model.NewAppError("deleteReactionForPost", "api.reaction.save.archived_channel.app_error", nil, "", http.StatusForbidden)
 	}
 
-	c.RequirePostId()
-	if c.Err != nil {
-		return
-	}
-
-	c.RequireEmojiName()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToChannelByPost(*c.AppContext.Session(), c.Params.PostId, model.PermissionRemoveReaction) {
-		c.SetPermissionError(model.PermissionRemoveReaction)
-		return
-	}
-
-	if c.Params.UserId != c.AppContext.Session().UserId && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionRemoveOthersReactions) {
-		c.SetPermissionError(model.PermissionRemoveOthersReactions)
-		return
-	}
-
-	reaction := &model.Reaction{
-		UserId:    c.Params.UserId,
-		PostId:    c.Params.PostId,
-		EmojiName: c.Params.EmojiName,
-	}
-
-	err := c.App.DeleteReactionForPost(c.AppContext, reaction)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	ReturnStatusOK(w)
-}
-
-func getBulkReactions(c *Context, w http.ResponseWriter, r *http.Request) {
-	postIds := model.ArrayFromJSON(r.Body)
-	for _, postId := range postIds {
-		if !c.App.SessionHasPermissionToChannelByPost(*c.AppContext.Session(), postId, model.PermissionReadChannel) {
-			c.SetPermissionError(model.PermissionReadChannel)
-			return
+	reaction, nErr := a.Srv().Store().Reaction().Save(reaction)
+	if nErr != nil {
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("SaveReactionForPost", "app.reaction.save.save.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
 		}
 	}
-	reactions, appErr := c.App.GetBulkReactionsForPosts(postIds)
-	if appErr != nil {
-		c.Err = appErr
-		return
+
+	// The post is always modified since the UpdateAt always changes
+	a.invalidateCacheForChannelPosts(post.ChannelId)
+
+	if pluginsEnvironment := a.GetPluginsEnvironment(); pluginsEnvironment != nil {
+		a.Srv().Go(func() {
+			pluginContext := pluginContext(c)
+			pluginsEnvironment.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+				hooks.ReactionHasBeenAdded(pluginContext, reaction)
+				return true
+			}, plugin.ReactionHasBeenAddedID)
+		})
 	}
 
-	js, err := json.Marshal(reactions)
+	a.Srv().Go(func() {
+		a.sendReactionEvent(model.WebsocketEventReactionAdded, reaction, post)
+	})
+
+	return reaction, nil
+}
+
+func (a *App) GetReactionsForPost(postID string) ([]*model.Reaction, *model.AppError) {
+	reactions, err := a.Srv().Store().Reaction().GetForPost(postID, true)
 	if err != nil {
-		c.Err = model.NewAppError("getBulkReactions", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return nil, model.NewAppError("GetReactionsForPost", "app.reaction.get_for_post.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
-	w.Write(js)
+	return reactions, nil
+}
+
+func (a *App) GetBulkReactionsForPosts(postIDs []string) (map[string][]*model.Reaction, *model.AppError) {
+	reactions := make(map[string][]*model.Reaction)
+
+	allReactions, err := a.Srv().Store().Reaction().BulkGetForPosts(postIDs)
+	if err != nil {
+		return nil, model.NewAppError("GetBulkReactionsForPosts", "app.reaction.bulk_get_for_post_ids.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, reaction := range allReactions {
+		reactionsForPost := reactions[reaction.PostId]
+		reactionsForPost = append(reactionsForPost, reaction)
+
+		reactions[reaction.PostId] = reactionsForPost
+	}
+
+	reactions = populateEmptyReactions(postIDs, reactions)
+	return reactions, nil
+}
+
+func populateEmptyReactions(postIDs []string, reactions map[string][]*model.Reaction) map[string][]*model.Reaction {
+	for _, postID := range postIDs {
+		if _, present := reactions[postID]; !present {
+			reactions[postID] = []*model.Reaction{}
+		}
+	}
+	return reactions
+}
+
+func (a *App) GetTopReactionsForTeamSince(teamID string, userID string, opts *model.InsightsOpts) (*model.TopReactionList, *model.AppError) {
+	if !a.Config().FeatureFlags.InsightsEnabled {
+		return nil, model.NewAppError("GetTopReactionsForTeamSince", "api.insights.feature_disabled", nil, "", http.StatusNotImplemented)
+	}
+
+	topReactionList, err := a.Srv().Store().Reaction().GetTopForTeamSince(teamID, userID, opts.StartUnixMilli, opts.Page*opts.PerPage, opts.PerPage)
+	if err != nil {
+		return nil, model.NewAppError("GetTopReactionsForTeamSince", model.NoTranslation, nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return topReactionList, nil
+}
+
+func (a *App) GetTopReactionsForUserSince(userID string, teamID string, opts *model.InsightsOpts) (*model.TopReactionList, *model.AppError) {
+	if !a.Config().FeatureFlags.InsightsEnabled {
+		return nil, model.NewAppError("GetTopReactionsForUserSince", "api.insights.feature_disabled", nil, "", http.StatusNotImplemented)
+	}
+
+	topReactionList, err := a.Srv().Store().Reaction().GetTopForUserSince(userID, teamID, opts.StartUnixMilli, opts.Page*opts.PerPage, opts.PerPage)
+	if err != nil {
+		return nil, model.NewAppError("GetTopReactionsForUserSince", model.NoTranslation, nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return topReactionList, nil
+}
+
+func (a *App) DeleteReactionForPost(c *request.Context, reaction *model.Reaction) *model.AppError {
+	post, err := a.GetSinglePost(reaction.PostId, false)
+	if err != nil {
+		return err
+	}
+
+	channel, err := a.GetChannel(c, post.ChannelId)
+	if err != nil {
+		return err
+	}
+
+	if channel.DeleteAt > 0 {
+		return model.NewAppError("DeleteReactionForPost", "api.reaction.delete.archived_channel.app_error", nil, "", http.StatusForbidden)
+	}
+
+	if _, err := a.Srv().Store().Reaction().Delete(reaction); err != nil {
+		return model.NewAppError("DeleteReactionForPost", "app.reaction.delete_all_with_emoji_name.get_reactions.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	// The post is always modified since the UpdateAt always changes
+	a.invalidateCacheForChannelPosts(post.ChannelId)
+
+	if pluginsEnvironment := a.GetPluginsEnvironment(); pluginsEnvironment != nil {
+		a.Srv().Go(func() {
+			pluginContext := pluginContext(c)
+			pluginsEnvironment.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+				hooks.ReactionHasBeenRemoved(pluginContext, reaction)
+				return true
+			}, plugin.ReactionHasBeenRemovedID)
+		})
+	}
+
+	a.Srv().Go(func() {
+		a.sendReactionEvent(model.WebsocketEventReactionRemoved, reaction, post)
+	})
+
+	return nil
+}
+
+func (a *App) sendReactionEvent(event string, reaction *model.Reaction, post *model.Post) {
+	// send out that a reaction has been added/removed
+	message := model.NewWebSocketEvent(event, "", post.ChannelId, "", nil, "")
+	reactionJSON, err := json.Marshal(reaction)
+	if err != nil {
+		a.Log().Warn("Failed to encode reaction to JSON", mlog.Err(err))
+	}
+	message.Add("reaction", string(reactionJSON))
+	a.Publish(message)
 }

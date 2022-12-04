@@ -1,67 +1,52 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
 	"net/http"
 
+	"github.com/mattermost/mattermost-server/v6/app/worktemplates"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/shared/i18n"
 )
 
-func (api *API) InitWorkTemplate() {
-	api.BaseRoutes.WorkTemplates.Handle("/categories", api.APISessionRequired(needsWorkTemplateFeatureFlag(getWorkTemplateCategories))).Methods("GET")
-	api.BaseRoutes.WorkTemplates.Handle("/categories/{category}/templates", api.APISessionRequired(needsWorkTemplateFeatureFlag(getWorkTemplates))).Methods("GET")
+func (a *App) GetWorkTemplateCategories(t i18n.TranslateFunc) ([]*model.WorkTemplateCategory, *model.AppError) {
+	categories, err := worktemplates.ListCategories()
+	if err != nil {
+		return nil, model.NewAppError("GetWorkTemplateCategories", "app.worktemplates.get_categories.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	modelCategories := make([]*model.WorkTemplateCategory, len(categories))
+	for i := range categories {
+		modelCategories[i] = &model.WorkTemplateCategory{
+			ID:   categories[i].ID,
+			Name: t(categories[i].Name),
+		}
+	}
+
+	return modelCategories, nil
 }
 
-func needsWorkTemplateFeatureFlag(h handlerFunc) handlerFunc {
-	return func(c *Context, w http.ResponseWriter, r *http.Request) {
-		if !c.App.Config().FeatureFlags.WorkTemplate {
-			http.NotFound(w, r)
-			return
+func (a *App) GetWorkTemplates(category string, featureFlags map[string]string, t i18n.TranslateFunc) ([]*model.WorkTemplate, *model.AppError) {
+	templates, err := worktemplates.ListByCategory(category)
+	if err != nil {
+		return nil, model.NewAppError("GetWorkTemplates", "app.worktemplates.get_templates.app_error", nil, err.Error(), http.StatusInternalServerError)
+	}
+
+	// filter out templates that are not enabled by feature Flag
+	enabledTemplates := []*model.WorkTemplate{}
+	for _, template := range templates {
+		mTemplate := template.ToModelWorkTemplate(t)
+		if template.FeatureFlag == nil {
+			enabledTemplates = append(enabledTemplates, mTemplate)
+			continue
 		}
 
-		h(c, w, r)
-	}
-}
-
-func getWorkTemplateCategories(c *Context, w http.ResponseWriter, r *http.Request) {
-	t := c.AppContext.GetT()
-
-	categories, appErr := c.App.GetWorkTemplateCategories(t)
-	if appErr != nil {
-		c.Err = appErr
-		return
+		if featureFlags[template.FeatureFlag.Name] == template.FeatureFlag.Value {
+			enabledTemplates = append(enabledTemplates, mTemplate)
+		}
 	}
 
-	b, err := json.Marshal(categories)
-	if err != nil {
-		c.Err = model.NewAppError("getWorkTemplateCategories", "api.marshal_error", nil, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(b)
-}
-
-func getWorkTemplates(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireCategory()
-	if c.Err != nil {
-		return
-	}
-	t := c.AppContext.GetT()
-
-	workTemplates, appErr := c.App.GetWorkTemplates(c.Params.Category, c.App.Config().FeatureFlags.ToMap(), t)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(workTemplates)
-	if err != nil {
-		c.Err = model.NewAppError("getWorkTemplates", "api.marshal_error", nil, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	w.Write(b)
+	return enabledTemplates, nil
 }

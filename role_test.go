@@ -1,320 +1,243 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
 	"context"
-	"sort"
+	"encoding/csv"
+	"io"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/utils"
 )
 
-func TestGetAllRoles(t *testing.T) {
-	th := Setup(t)
-	defer th.TearDown()
-
-	roles, err := th.App.Srv().Store().Role().GetAll()
-	require.NoError(t, err)
-
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		received, resp, err := client.GetAllRoles()
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		assert.EqualValues(t, received, roles)
-	})
-
-	t.Run("NormalClient", func(t *testing.T) {
-		_, resp, err := th.Client.GetAllRoles()
-		require.Error(t, err)
-		CheckForbiddenStatus(t, resp)
-	})
+type permissionInheritanceTestData struct {
+	channelRole          *model.Role
+	permission           *model.Permission
+	shouldHavePermission bool
+	channel              *model.Channel
+	higherScopedRole     *model.Role
+	truthTableRow        []string
 }
 
-func TestGetRole(t *testing.T) {
-	th := Setup(t)
-	defer th.TearDown()
+func TestGetRolesByNames(t *testing.T) {
+	testPermissionInheritance(t, func(t *testing.T, th *TestHelper, testData permissionInheritanceTestData) {
+		actualRoles, err := th.App.GetRolesByNames([]string{testData.channelRole.Name})
+		require.Nil(t, err)
+		require.Len(t, actualRoles, 1)
 
-	role := &model.Role{
-		Name:          model.NewId(),
-		DisplayName:   model.NewId(),
-		Description:   model.NewId(),
-		Permissions:   []string{"manage_system", "create_public_channel"},
-		SchemeManaged: true,
-	}
+		actualRole := actualRoles[0]
+		require.NotNil(t, actualRole)
+		require.Equal(t, testData.channelRole.Name, actualRole.Name)
 
-	role, err := th.App.Srv().Store().Role().Save(role)
-	require.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(role.Id)
-
-	th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-		received, _, err := client.GetRole(role.Id)
-		require.NoError(t, err)
-
-		assert.Equal(t, received.Id, role.Id)
-		assert.Equal(t, received.Name, role.Name)
-		assert.Equal(t, received.DisplayName, role.DisplayName)
-		assert.Equal(t, received.Description, role.Description)
-		assert.EqualValues(t, received.Permissions, role.Permissions)
-		assert.Equal(t, received.SchemeManaged, role.SchemeManaged)
-	})
-
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		_, resp, err := client.GetRole("1234")
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-
-		_, resp, err = client.GetRole(model.NewId())
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+		require.Equal(t, testData.shouldHavePermission, utils.StringInSlice(testData.permission.Id, actualRole.Permissions))
 	})
 }
 
 func TestGetRoleByName(t *testing.T) {
-	th := Setup(t)
-	defer th.TearDown()
-
-	role := &model.Role{
-		Name:          model.NewId(),
-		DisplayName:   model.NewId(),
-		Description:   model.NewId(),
-		Permissions:   []string{"manage_system", "create_public_channel"},
-		SchemeManaged: true,
-	}
-
-	role, err := th.App.Srv().Store().Role().Save(role)
-	assert.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(role.Id)
-
-	th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-		received, _, err := client.GetRoleByName(role.Name)
-		require.NoError(t, err)
-
-		assert.Equal(t, received.Id, role.Id)
-		assert.Equal(t, received.Name, role.Name)
-		assert.Equal(t, received.DisplayName, role.DisplayName)
-		assert.Equal(t, received.Description, role.Description)
-		assert.EqualValues(t, received.Permissions, role.Permissions)
-		assert.Equal(t, received.SchemeManaged, role.SchemeManaged)
-	})
-
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		_, resp, err := client.GetRoleByName(strings.Repeat("abcdefghij", 10))
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-
-		_, resp, err = client.GetRoleByName(model.NewId())
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+	testPermissionInheritance(t, func(t *testing.T, th *TestHelper, testData permissionInheritanceTestData) {
+		actualRole, err := th.App.GetRoleByName(context.Background(), testData.channelRole.Name)
+		require.Nil(t, err)
+		require.NotNil(t, actualRole)
+		require.Equal(t, testData.channelRole.Name, actualRole.Name)
+		require.Equal(t, testData.shouldHavePermission, utils.StringInSlice(testData.permission.Id, actualRole.Permissions), "row: %+v", testData.truthTableRow)
 	})
 }
 
-func TestGetRolesByNames(t *testing.T) {
-	th := Setup(t)
-	defer th.TearDown()
-
-	role1 := &model.Role{
-		Name:          model.NewId(),
-		DisplayName:   model.NewId(),
-		Description:   model.NewId(),
-		Permissions:   []string{"manage_system", "create_public_channel"},
-		SchemeManaged: true,
-	}
-	role2 := &model.Role{
-		Name:          model.NewId(),
-		DisplayName:   model.NewId(),
-		Description:   model.NewId(),
-		Permissions:   []string{"manage_system", "delete_private_channel"},
-		SchemeManaged: true,
-	}
-	role3 := &model.Role{
-		Name:          model.NewId(),
-		DisplayName:   model.NewId(),
-		Description:   model.NewId(),
-		Permissions:   []string{"manage_system", "manage_public_channel_properties"},
-		SchemeManaged: true,
-	}
-
-	role1, err := th.App.Srv().Store().Role().Save(role1)
-	assert.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(role1.Id)
-
-	role2, err = th.App.Srv().Store().Role().Save(role2)
-	assert.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(role2.Id)
-
-	role3, err = th.App.Srv().Store().Role().Save(role3)
-	assert.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(role3.Id)
-
-	th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-		// Check all three roles can be found.
-		received, _, err := client.GetRolesByNames([]string{role1.Name, role2.Name, role3.Name})
-		require.NoError(t, err)
-
-		assert.Contains(t, received, role1)
-		assert.Contains(t, received, role2)
-		assert.Contains(t, received, role3)
-
-		// Check a list of non-existent roles.
-		_, _, err = client.GetRolesByNames([]string{model.NewId(), model.NewId()})
-		require.NoError(t, err)
+func TestGetRoleByID(t *testing.T) {
+	testPermissionInheritance(t, func(t *testing.T, th *TestHelper, testData permissionInheritanceTestData) {
+		actualRole, err := th.App.GetRole(testData.channelRole.Id)
+		require.Nil(t, err)
+		require.NotNil(t, actualRole)
+		require.Equal(t, testData.channelRole.Id, actualRole.Id)
+		require.Equal(t, testData.shouldHavePermission, utils.StringInSlice(testData.permission.Id, actualRole.Permissions), "row: %+v", testData.truthTableRow)
 	})
-
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		// Empty list should error.
-		_, resp, err := client.GetRolesByNames([]string{})
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
-
-	th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-		// Invalid role name should error.
-		_, resp, err := client.GetRolesByNames([]string{model.NewId(), model.NewId(), "!!!!!!"})
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-
-		// Empty/whitespace rolenames should be ignored.
-		_, _, err = client.GetRolesByNames([]string{model.NewId(), model.NewId(), "", "    "})
-		require.NoError(t, err)
-	})
-
 }
 
-func TestPatchRole(t *testing.T) {
-	th := Setup(t)
+func TestGetAllRoles(t *testing.T) {
+	testPermissionInheritance(t, func(t *testing.T, th *TestHelper, testData permissionInheritanceTestData) {
+		actualRoles, err := th.App.GetAllRoles()
+		require.Nil(t, err)
+		for _, actualRole := range actualRoles {
+			if actualRole.Id == testData.channelRole.Id {
+				require.NotNil(t, actualRole)
+				require.Equal(t, testData.channelRole.Id, actualRole.Id)
+				require.Equal(t, testData.shouldHavePermission, utils.StringInSlice(testData.permission.Id, actualRole.Permissions), "row: %+v", testData.truthTableRow)
+			}
+		}
+	})
+}
+
+// testPermissionInheritance tests 48 combinations of scheme, permission, role data.
+func testPermissionInheritance(t *testing.T, testCallback func(t *testing.T, th *TestHelper, testData permissionInheritanceTestData)) {
+	th := Setup(t).InitBasic()
 	defer th.TearDown()
 
-	role := &model.Role{
-		Name:          model.NewId(),
-		DisplayName:   model.NewId(),
-		Description:   model.NewId(),
-		Permissions:   []string{"manage_system", "create_public_channel", "manage_slash_commands"},
-		SchemeManaged: true,
+	th.App.Srv().SetLicense(model.NewTestLicense(""))
+	th.App.SetPhase2PermissionsMigrationStatus(true)
+
+	permissionsDefault := []string{
+		model.PermissionManageChannelRoles.Id,
+		model.PermissionManagePublicChannelMembers.Id,
 	}
 
-	role, err2 := th.App.Srv().Store().Role().Save(role)
-	assert.NoError(t, err2)
-	defer th.App.Srv().Store().Job().Delete(role.Id)
-
-	patch := &model.RolePatch{
-		Permissions: &[]string{"manage_system", "create_public_channel", "manage_incoming_webhooks", "manage_outgoing_webhooks"},
-	}
-
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-
-		// Cannot edit a system admin
-		adminRole, err := th.App.Srv().Store().Role().GetByName(context.Background(), "system_admin")
-		assert.NoError(t, err)
-		defer th.App.Srv().Store().Job().Delete(adminRole.Id)
-
-		_, resp, err := client.PatchRole(adminRole.Id, patch)
-		require.Error(t, err)
-		CheckNotImplementedStatus(t, resp)
-
-		// Cannot give other roles read / write to system roles or manage roles because only system admin can do these actions
-		systemManager, err := th.App.Srv().Store().Role().GetByName(context.Background(), "system_manager")
-		assert.NoError(t, err)
-		defer th.App.Srv().Store().Job().Delete(systemManager.Id)
-
-		patchWriteSystemRoles := &model.RolePatch{
-			Permissions: &[]string{model.PermissionSysconsoleWriteUserManagementSystemRoles.Id},
-		}
-
-		_, resp, err = client.PatchRole(systemManager.Id, patchWriteSystemRoles)
-		require.Error(t, err)
-		CheckNotImplementedStatus(t, resp)
-
-		patchReadSystemRoles := &model.RolePatch{
-			Permissions: &[]string{model.PermissionSysconsoleReadUserManagementSystemRoles.Id},
-		}
-
-		_, resp, err = client.PatchRole(systemManager.Id, patchReadSystemRoles)
-		require.Error(t, err)
-		CheckNotImplementedStatus(t, resp)
-
-		patchManageRoles := &model.RolePatch{
-			Permissions: &[]string{model.PermissionManageRoles.Id},
-		}
-
-		_, resp, err = client.PatchRole(systemManager.Id, patchManageRoles)
-		require.Error(t, err)
-		CheckNotImplementedStatus(t, resp)
+	// Defer resetting the system scheme permissions
+	systemSchemeRoles, err := th.App.GetRolesByNames([]string{
+		model.ChannelGuestRoleId,
+		model.ChannelUserRoleId,
+		model.ChannelAdminRoleId,
 	})
+	require.Nil(t, err)
+	require.Len(t, systemSchemeRoles, 3)
 
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		received, _, err := client.PatchRole(role.Id, patch)
-		require.NoError(t, err)
-
-		assert.Equal(t, received.Id, role.Id)
-		assert.Equal(t, received.Name, role.Name)
-		assert.Equal(t, received.DisplayName, role.DisplayName)
-		assert.Equal(t, received.Description, role.Description)
-		perms := []string{"manage_system", "create_public_channel", "manage_incoming_webhooks", "manage_outgoing_webhooks"}
-		sort.Strings(perms)
-		assert.EqualValues(t, received.Permissions, perms)
-		assert.Equal(t, received.SchemeManaged, role.SchemeManaged)
-
-		// Check a no-op patch succeeds.
-		_, _, err = client.PatchRole(role.Id, patch)
-		require.NoError(t, err)
-
-		_, resp, err := client.PatchRole("junk", patch)
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
-
-	_, resp, err := th.Client.PatchRole(model.NewId(), patch)
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
-
-	_, resp, err = th.Client.PatchRole(role.Id, patch)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
-
-	patch = &model.RolePatch{
-		Permissions: &[]string{"manage_system", "manage_incoming_webhooks", "manage_outgoing_webhooks"},
-	}
-
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		received, _, err := client.PatchRole(role.Id, patch)
-		require.NoError(t, err)
-
-		assert.Equal(t, received.Id, role.Id)
-		assert.Equal(t, received.Name, role.Name)
-		assert.Equal(t, received.DisplayName, role.DisplayName)
-		assert.Equal(t, received.Description, role.Description)
-		perms := []string{"manage_system", "manage_incoming_webhooks", "manage_outgoing_webhooks"}
-		sort.Strings(perms)
-		assert.EqualValues(t, received.Permissions, perms)
-		assert.Equal(t, received.SchemeManaged, role.SchemeManaged)
-
-		t.Run("Check guest permissions editing without E20 license", func(t *testing.T) {
-			license := model.NewTestLicense()
-			license.Features.GuestAccountsPermissions = model.NewBool(false)
-			th.App.Srv().SetLicense(license)
-
-			guestRole, err := th.App.Srv().Store().Role().GetByName(context.Background(), "system_guest")
-			require.NoError(t, err)
-			received, resp, err = client.PatchRole(guestRole.Id, patch)
-			require.Error(t, err)
-			CheckNotImplementedStatus(t, resp)
+	// defer resetting the system role permissions
+	for _, systemRole := range systemSchemeRoles {
+		defer th.App.PatchRole(systemRole, &model.RolePatch{
+			Permissions: &systemRole.Permissions,
 		})
+	}
 
-		t.Run("Check guest permissions editing with E20 license", func(t *testing.T) {
-			license := model.NewTestLicense()
-			license.Features.GuestAccountsPermissions = model.NewBool(true)
-			th.App.Srv().SetLicense(license)
-			guestRole, err := th.App.Srv().Store().Role().GetByName(context.Background(), "system_guest")
-			require.NoError(t, err)
-			_, _, err = client.PatchRole(guestRole.Id, patch)
-			require.NoError(t, err)
-		})
+	// Make a channel scheme, clear its permissions
+	channelScheme, err := th.App.CreateScheme(&model.Scheme{
+		Name:        model.NewId(),
+		DisplayName: model.NewId(),
+		Scope:       model.SchemeScopeChannel,
 	})
+	require.Nil(t, err)
+	defer th.App.DeleteScheme(channelScheme.Id)
+
+	team := th.CreateTeam()
+	defer th.App.PermanentDeleteTeamId(th.Context, team.Id)
+
+	// Make a channel
+	channel := th.CreateChannel(th.Context, team)
+	defer th.App.PermanentDeleteChannel(th.Context, channel)
+
+	// Set the channel scheme
+	channel.SchemeId = &channelScheme.Id
+	channel, err = th.App.UpdateChannelScheme(th.Context, channel)
+	require.Nil(t, err)
+
+	// Get the truth table from CSV
+	file, e := os.Open("tests/channel-role-has-permission.csv")
+	require.NoError(t, e)
+	defer file.Close()
+
+	b, e := io.ReadAll(file)
+	require.NoError(t, e)
+
+	r := csv.NewReader(strings.NewReader(string(b)))
+	records, e := r.ReadAll()
+	require.NoError(t, e)
+
+	test := func(higherScopedGuest, higherScopedUser, higherScopedAdmin string) {
+		for _, roleNameUnderTest := range []string{higherScopedGuest, higherScopedUser, higherScopedAdmin} {
+			for i, row := range records {
+				// skip csv header
+				if i == 0 {
+					continue
+				}
+
+				higherSchemeHasPermission, e := strconv.ParseBool(row[0])
+				require.NoError(t, e)
+
+				permissionIsModerated, e := strconv.ParseBool(row[1])
+				require.NoError(t, e)
+
+				channelSchemeHasPermission, e := strconv.ParseBool(row[2])
+				require.NoError(t, e)
+
+				channelRoleIsChannelAdmin, e := strconv.ParseBool(row[3])
+				require.NoError(t, e)
+
+				shouldHavePermission, e := strconv.ParseBool(row[4])
+				require.NoError(t, e)
+
+				// skip some invalid combinations because of the outer loop iterating all 3 channel roles
+				if (channelRoleIsChannelAdmin && roleNameUnderTest != higherScopedAdmin) || (!channelRoleIsChannelAdmin && roleNameUnderTest == higherScopedAdmin) {
+					continue
+				}
+
+				// select the permission to test (moderated or non-moderated)
+				var permission *model.Permission
+				if permissionIsModerated {
+					permission = model.PermissionCreatePost // moderated
+				} else {
+					permission = model.PermissionReadChannel // non-moderated
+				}
+
+				// add or remove the permission from the higher-scoped scheme
+				higherScopedRole, testErr := th.App.GetRoleByName(context.Background(), roleNameUnderTest)
+				require.Nil(t, testErr)
+
+				var higherScopedPermissions []string
+				if higherSchemeHasPermission {
+					higherScopedPermissions = []string{permission.Id}
+				} else {
+					higherScopedPermissions = permissionsDefault
+				}
+				higherScopedRole, testErr = th.App.PatchRole(higherScopedRole, &model.RolePatch{Permissions: &higherScopedPermissions})
+				require.Nil(t, testErr)
+
+				// get channel role
+				var channelRoleName string
+				switch roleNameUnderTest {
+				case higherScopedGuest:
+					channelRoleName = channelScheme.DefaultChannelGuestRole
+				case higherScopedUser:
+					channelRoleName = channelScheme.DefaultChannelUserRole
+				case higherScopedAdmin:
+					channelRoleName = channelScheme.DefaultChannelAdminRole
+				}
+				channelRole, testErr := th.App.GetRoleByName(context.Background(), channelRoleName)
+				require.Nil(t, testErr)
+
+				// add or remove the permission from the channel scheme
+				var channelSchemePermissions []string
+				if channelSchemeHasPermission {
+					channelSchemePermissions = []string{permission.Id}
+				} else {
+					channelSchemePermissions = permissionsDefault
+				}
+				channelRole, testErr = th.App.PatchRole(channelRole, &model.RolePatch{Permissions: &channelSchemePermissions})
+				require.Nil(t, testErr)
+
+				testCallback(t, th, permissionInheritanceTestData{
+					channelRole:          channelRole,
+					permission:           permission,
+					shouldHavePermission: shouldHavePermission,
+					channel:              channel,
+					higherScopedRole:     higherScopedRole,
+					truthTableRow:        row,
+				})
+			}
+		}
+	}
+
+	// test 24 combinations where the higher-scoped scheme is the SYSTEM scheme
+	test(model.ChannelGuestRoleId, model.ChannelUserRoleId, model.ChannelAdminRoleId)
+
+	// create a team scheme
+	teamScheme, err := th.App.CreateScheme(&model.Scheme{
+		Name:        model.NewId(),
+		DisplayName: model.NewId(),
+		Scope:       model.SchemeScopeTeam,
+	})
+	require.Nil(t, err)
+	defer th.App.DeleteScheme(teamScheme.Id)
+
+	// assign the scheme to the team
+	team.SchemeId = &teamScheme.Id
+	_, err = th.App.UpdateTeamScheme(team)
+	require.Nil(t, err)
+
+	// test 24 combinations where the higher-scoped scheme is a TEAM scheme
+	test(teamScheme.DefaultChannelGuestRole, teamScheme.DefaultChannelUserRole, teamScheme.DefaultChannelAdminRole)
 }

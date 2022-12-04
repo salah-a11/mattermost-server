@@ -1,244 +1,102 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
 	"testing"
-	"time"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
 
+	"github.com/mattermost/mattermost-server/v6/app/users"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/store"
+	"github.com/mattermost/mattermost-server/v6/store/storetest/mocks"
 )
 
-func TestGetUserStatus(t *testing.T) {
+func TestCustomStatus(t *testing.T) {
 	th := Setup(t).InitBasic()
 	defer th.TearDown()
-	client := th.Client
 
-	t.Run("offline status", func(t *testing.T) {
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "offline", userStatus.Status)
-	})
+	user := th.BasicUser
 
-	t.Run("online status", func(t *testing.T) {
-		th.App.SetStatusOnline(th.BasicUser.Id, true)
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "online", userStatus.Status)
-	})
+	cs := &model.CustomStatus{
+		Emoji: ":smile:",
+		Text:  "honk!",
+	}
 
-	t.Run("away status", func(t *testing.T) {
-		th.App.SetStatusAwayIfNeeded(th.BasicUser.Id, true)
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "away", userStatus.Status)
-	})
+	err := th.App.SetCustomStatus(th.Context, user.Id, cs)
+	require.Nil(t, err, "failed to set custom status %v", err)
 
-	t.Run("dnd status", func(t *testing.T) {
-		th.App.SetStatusDoNotDisturb(th.BasicUser.Id)
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "dnd", userStatus.Status)
-	})
+	csSaved, err := th.App.GetCustomStatus(user.Id)
+	require.Nil(t, err, "failed to get custom status after save %v", err)
+	require.Equal(t, cs, csSaved)
 
-	t.Run("dnd status timed", func(t *testing.T) {
-		th.App.SetStatusDoNotDisturbTimed(th.BasicUser.Id, time.Now().Add(10*time.Minute).Unix())
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "dnd", userStatus.Status)
-	})
+	err = th.App.RemoveCustomStatus(th.Context, user.Id)
+	require.Nil(t, err, "failed to to clear custom status %v", err)
 
-	t.Run("dnd status timed restore after time interval", func(t *testing.T) {
-		task := model.CreateRecurringTaskFromNextIntervalTime("Unset DND Statuses From Test", th.App.UpdateDNDStatusOfUsers, 1*time.Second)
-		defer task.Cancel()
-		th.App.SetStatusOnline(th.BasicUser.Id, true)
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "online", userStatus.Status)
-		th.App.SetStatusDoNotDisturbTimed(th.BasicUser.Id, time.Now().Add(2*time.Second).Unix())
-		userStatus, _, err = client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "dnd", userStatus.Status)
-		time.Sleep(3 * time.Second)
-		userStatus, _, err = client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "online", userStatus.Status)
-	})
-
-	t.Run("back to offline status", func(t *testing.T) {
-		th.App.SetStatusOffline(th.BasicUser.Id, true)
-		userStatus, _, err := client.GetUserStatus(th.BasicUser.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "offline", userStatus.Status)
-	})
-
-	t.Run("get other user status", func(t *testing.T) {
-		//Get user2 status logged as user1
-		userStatus, _, err := client.GetUserStatus(th.BasicUser2.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "offline", userStatus.Status)
-	})
-
-	t.Run("get status from logged out user", func(t *testing.T) {
-		client.Logout()
-		_, resp, err := client.GetUserStatus(th.BasicUser2.Id, "")
-		require.Error(t, err)
-		CheckUnauthorizedStatus(t, resp)
-	})
-
-	t.Run("get status from other user", func(t *testing.T) {
-		th.LoginBasic2()
-		userStatus, _, err := client.GetUserStatus(th.BasicUser2.Id, "")
-		require.NoError(t, err)
-		assert.Equal(t, "offline", userStatus.Status)
-	})
+	var csClear *model.CustomStatus
+	csSaved, err = th.App.GetCustomStatus(user.Id)
+	require.Nil(t, err, "failed to get custom status after clear %v", err)
+	require.Equal(t, csClear, csSaved)
 }
 
-func TestGetUsersStatusesByIds(t *testing.T) {
-	th := Setup(t).InitBasic()
-	defer th.TearDown()
-	client := th.Client
+func TestCustomStatusErrors(t *testing.T) {
 
-	usersIds := []string{th.BasicUser.Id, th.BasicUser2.Id}
+	fakeUserID := "foobar"
+	mockErr := store.NewErrNotFound("User", fakeUserID)
+	mockUser := &model.User{Id: fakeUserID}
 
-	t.Run("empty userIds list", func(t *testing.T) {
-		_, resp, err := client.GetUsersStatusesByIds([]string{})
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
+	tests := map[string]struct {
+		customStatus string
+		successFn    string
+		failFn       string
+		expectedErr  string
+	}{
+		"set custom status fails on get user":       {customStatus: "set", successFn: "Update", failFn: "Get", expectedErr: MissingAccountError},
+		"set custom status fails on update user":    {customStatus: "set", successFn: "Get", failFn: "Update", expectedErr: "app.user.update.finding.app_error"},
+		"remove custom status fails on get user":    {customStatus: "remove", successFn: "Update", failFn: "Get", expectedErr: MissingAccountError},
+		"remove custom status fails on update user": {customStatus: "remove", successFn: "Get", failFn: "Update", expectedErr: "app.user.update.finding.app_error"},
+	}
 
-	t.Run("completely invalid userIds list", func(t *testing.T) {
-		_, resp, err := client.GetUsersStatusesByIds([]string{"invalid_user_id", "invalid_user_id"})
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
+	for name, tc := range tests {
+		t.Run(name, func(t *testing.T) {
+			th := SetupWithStoreMock(t)
+			defer th.TearDown()
 
-	t.Run("partly invalid userIds list", func(t *testing.T) {
-		_, resp, err := client.GetUsersStatusesByIds([]string{th.BasicUser.Id, "invalid_user_id"})
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
+			mockUserStore := mocks.UserStore{}
 
-	t.Run("offline status", func(t *testing.T) {
-		usersStatuses, _, err := client.GetUsersStatusesByIds(usersIds)
-		require.NoError(t, err)
-		for _, userStatus := range usersStatuses {
-			assert.Equal(t, "offline", userStatus.Status)
-		}
-	})
+			mockUserStore.On(tc.successFn, mock.Anything, mock.Anything).Return(mockUser, nil)
+			mockUserStore.On(tc.failFn, mock.Anything, mock.Anything).Return(nil, mockErr)
 
-	t.Run("online status", func(t *testing.T) {
-		th.App.SetStatusOnline(th.BasicUser.Id, true)
-		th.App.SetStatusOnline(th.BasicUser2.Id, true)
-		usersStatuses, _, err := client.GetUsersStatusesByIds(usersIds)
-		require.NoError(t, err)
-		for _, userStatus := range usersStatuses {
-			assert.Equal(t, "online", userStatus.Status)
-		}
-	})
+			var err error
+			mockSessionStore := mocks.SessionStore{}
+			mockOAuthStore := mocks.OAuthStore{}
+			th.App.ch.srv.userService, err = users.New(users.ServiceConfig{
+				UserStore:    &mockUserStore,
+				SessionStore: &mockSessionStore,
+				OAuthStore:   &mockOAuthStore,
+				ConfigFn:     th.App.ch.srv.platform.Config,
+				LicenseFn:    th.App.ch.srv.License,
+			})
+			require.NoError(t, err)
 
-	t.Run("away status", func(t *testing.T) {
-		th.App.SetStatusAwayIfNeeded(th.BasicUser.Id, true)
-		th.App.SetStatusAwayIfNeeded(th.BasicUser2.Id, true)
-		usersStatuses, _, err := client.GetUsersStatusesByIds(usersIds)
-		require.NoError(t, err)
-		for _, userStatus := range usersStatuses {
-			assert.Equal(t, "away", userStatus.Status)
-		}
-	})
+			cs := &model.CustomStatus{
+				Emoji: ":smile:",
+				Text:  "honk!",
+			}
 
-	t.Run("dnd status", func(t *testing.T) {
-		th.App.SetStatusDoNotDisturb(th.BasicUser.Id)
-		th.App.SetStatusDoNotDisturb(th.BasicUser2.Id)
-		usersStatuses, _, err := client.GetUsersStatusesByIds(usersIds)
-		require.NoError(t, err)
-		for _, userStatus := range usersStatuses {
-			assert.Equal(t, "dnd", userStatus.Status)
-		}
-	})
+			var appErr *model.AppError
+			switch tc.customStatus {
+			case "set":
+				appErr = th.App.SetCustomStatus(th.Context, fakeUserID, cs)
+			case "remove":
+				appErr = th.App.RemoveCustomStatus(th.Context, fakeUserID)
+			}
 
-	t.Run("dnd status", func(t *testing.T) {
-		th.App.SetStatusDoNotDisturbTimed(th.BasicUser.Id, time.Now().Add(10*time.Minute).Unix())
-		th.App.SetStatusDoNotDisturbTimed(th.BasicUser2.Id, time.Now().Add(15*time.Minute).Unix())
-		usersStatuses, _, err := client.GetUsersStatusesByIds(usersIds)
-		require.NoError(t, err)
-		for _, userStatus := range usersStatuses {
-			assert.Equal(t, "dnd", userStatus.Status)
-		}
-	})
-
-	t.Run("get statuses from logged out user", func(t *testing.T) {
-		client.Logout()
-
-		_, resp, err := client.GetUsersStatusesByIds(usersIds)
-		require.Error(t, err)
-		CheckUnauthorizedStatus(t, resp)
-	})
-}
-
-func TestUpdateUserStatus(t *testing.T) {
-	th := Setup(t).InitBasic()
-	defer th.TearDown()
-	client := th.Client
-
-	t.Run("set online status", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "online", UserId: th.BasicUser.Id}
-		updateUserStatus, _, err := client.UpdateUserStatus(th.BasicUser.Id, toUpdateUserStatus)
-		require.NoError(t, err)
-		assert.Equal(t, "online", updateUserStatus.Status)
-	})
-
-	t.Run("set away status", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "away", UserId: th.BasicUser.Id}
-		updateUserStatus, _, err := client.UpdateUserStatus(th.BasicUser.Id, toUpdateUserStatus)
-		require.NoError(t, err)
-		assert.Equal(t, "away", updateUserStatus.Status)
-	})
-
-	t.Run("set dnd status timed", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "dnd", UserId: th.BasicUser.Id, DNDEndTime: time.Now().Add(10 * time.Minute).Unix()}
-		updateUserStatus, _, err := client.UpdateUserStatus(th.BasicUser.Id, toUpdateUserStatus)
-		require.NoError(t, err)
-		assert.Equal(t, "dnd", updateUserStatus.Status)
-	})
-
-	t.Run("set offline status", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "offline", UserId: th.BasicUser.Id}
-		updateUserStatus, _, err := client.UpdateUserStatus(th.BasicUser.Id, toUpdateUserStatus)
-		require.NoError(t, err)
-		assert.Equal(t, "offline", updateUserStatus.Status)
-	})
-
-	t.Run("set status for other user as regular user", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "online", UserId: th.BasicUser2.Id}
-		_, resp, err := client.UpdateUserStatus(th.BasicUser2.Id, toUpdateUserStatus)
-		require.Error(t, err)
-		CheckForbiddenStatus(t, resp)
-	})
-
-	t.Run("set status for other user as admin user", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "online", UserId: th.BasicUser2.Id}
-		updateUserStatus, _, _ := th.SystemAdminClient.UpdateUserStatus(th.BasicUser2.Id, toUpdateUserStatus)
-		assert.Equal(t, "online", updateUserStatus.Status)
-	})
-
-	t.Run("not matching status user id and the user id passed in the function", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "online", UserId: th.BasicUser2.Id}
-		_, resp, err := client.UpdateUserStatus(th.BasicUser.Id, toUpdateUserStatus)
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
-
-	t.Run("get statuses from logged out user", func(t *testing.T) {
-		toUpdateUserStatus := &model.Status{Status: "online", UserId: th.BasicUser2.Id}
-		client.Logout()
-
-		_, resp, err := client.UpdateUserStatus(th.BasicUser2.Id, toUpdateUserStatus)
-		require.Error(t, err)
-		CheckUnauthorizedStatus(t, resp)
-	})
+			require.NotNil(t, appErr)
+			require.Equal(t, tc.expectedErr, appErr.Id)
+		})
+	}
 }

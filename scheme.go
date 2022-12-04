@@ -1,263 +1,232 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
-	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitScheme() {
-	api.BaseRoutes.Schemes.Handle("", api.APISessionRequired(getSchemes)).Methods("GET")
-	api.BaseRoutes.Schemes.Handle("", api.APISessionRequired(createScheme)).Methods("POST")
-	api.BaseRoutes.Schemes.Handle("/{scheme_id:[A-Za-z0-9]+}", api.APISessionRequired(deleteScheme)).Methods("DELETE")
-	api.BaseRoutes.Schemes.Handle("/{scheme_id:[A-Za-z0-9]+}", api.APISessionRequiredTrustRequester(getScheme)).Methods("GET")
-	api.BaseRoutes.Schemes.Handle("/{scheme_id:[A-Za-z0-9]+}/patch", api.APISessionRequired(patchScheme)).Methods("PUT")
-	api.BaseRoutes.Schemes.Handle("/{scheme_id:[A-Za-z0-9]+}/teams", api.APISessionRequiredTrustRequester(getTeamsForScheme)).Methods("GET")
-	api.BaseRoutes.Schemes.Handle("/{scheme_id:[A-Za-z0-9]+}/channels", api.APISessionRequiredTrustRequester(getChannelsForScheme)).Methods("GET")
+func (a *App) GetScheme(id string) (*model.Scheme, *model.AppError) {
+	if appErr := a.IsPhase2MigrationCompleted(); appErr != nil {
+		return nil, appErr
+	}
+
+	scheme, err := a.Srv().Store().Scheme().Get(id)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetScheme", "app.scheme.get.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetScheme", "app.scheme.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+	return scheme, nil
 }
 
-func createScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	var scheme model.Scheme
-	if jsonErr := json.NewDecoder(r.Body).Decode(&scheme); jsonErr != nil {
-		c.SetInvalidParamWithErr("scheme", jsonErr)
-		return
+func (a *App) GetSchemeByName(name string) (*model.Scheme, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	auditRec := c.MakeAuditRecord("createScheme", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("scheme", scheme)
-
-	if c.App.Channels().License() == nil || (!*c.App.Channels().License().Features.CustomPermissionsSchemes && c.App.Channels().License().SkuShortName != model.LicenseShortSkuProfessional) {
-		c.Err = model.NewAppError("Api4.CreateScheme", "api.scheme.create_scheme.license.error", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleWriteUserManagementPermissions) {
-		c.SetPermissionError(model.PermissionSysconsoleWriteUserManagementPermissions)
-		return
-	}
-
-	returnedScheme, err := c.App.CreateScheme(&scheme)
+	scheme, err := a.Srv().Store().Scheme().GetByName(name)
 	if err != nil {
-		c.Err = err
-		return
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetSchemeByName", "app.scheme.get.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetSchemeByName", "app.scheme.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
-
-	auditRec.Success()
-	auditRec.AddEventResultState(returnedScheme)
-	auditRec.AddEventObjectType("scheme")
-
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(returnedScheme); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return scheme, nil
 }
 
-func getScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireSchemeId()
-	if c.Err != nil {
-		return
+func (a *App) GetSchemesPage(scope string, page int, perPage int) ([]*model.Scheme, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementPermissions) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementPermissions)
-		return
-	}
-
-	scheme, err := c.App.GetScheme(c.Params.SchemeId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(scheme); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return a.GetSchemes(scope, page*perPage, perPage)
 }
 
-func getSchemes(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementPermissions) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementPermissions)
-		return
+func (s *Server) GetSchemes(scope string, offset int, limit int) ([]*model.Scheme, *model.AppError) {
+	if err := s.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	scope := c.Params.Scope
-	if scope != "" && scope != model.SchemeScopeTeam && scope != model.SchemeScopeChannel {
-		c.SetInvalidParam("scope")
-		return
-	}
-
-	schemes, appErr := c.App.GetSchemesPage(c.Params.Scope, c.Params.Page, c.Params.PerPage)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(schemes)
+	scheme, err := s.Store().Scheme().GetAllPage(scope, offset, limit)
 	if err != nil {
-		c.Err = model.NewAppError("getSchemes", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return nil, model.NewAppError("GetSchemes", "app.scheme.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
-
-	w.Write(js)
+	return scheme, nil
 }
 
-func getTeamsForScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireSchemeId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementTeams) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementTeams)
-		return
-	}
-
-	scheme, appErr := c.App.GetScheme(c.Params.SchemeId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if scheme.Scope != model.SchemeScopeTeam {
-		c.Err = model.NewAppError("Api4.GetTeamsForScheme", "api.scheme.get_teams_for_scheme.scope.error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	teams, appErr := c.App.GetTeamsForSchemePage(scheme, c.Params.Page, c.Params.PerPage)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(teams)
-	if err != nil {
-		c.Err = model.NewAppError("getTeamsForScheme", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
+func (a *App) GetSchemes(scope string, offset int, limit int) ([]*model.Scheme, *model.AppError) {
+	return a.Srv().GetSchemes(scope, offset, limit)
 }
 
-func getChannelsForScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireSchemeId()
-	if c.Err != nil {
-		return
+func (a *App) CreateScheme(scheme *model.Scheme) (*model.Scheme, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementChannels) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementChannels)
-		return
-	}
+	// Clear any user-provided values for trusted properties.
+	scheme.DefaultTeamAdminRole = ""
+	scheme.DefaultTeamUserRole = ""
+	scheme.DefaultTeamGuestRole = ""
+	scheme.DefaultChannelAdminRole = ""
+	scheme.DefaultChannelUserRole = ""
+	scheme.DefaultChannelGuestRole = ""
+	scheme.DefaultPlaybookAdminRole = ""
+	scheme.DefaultPlaybookMemberRole = ""
+	scheme.DefaultRunAdminRole = ""
+	scheme.DefaultRunMemberRole = ""
+	scheme.CreateAt = 0
+	scheme.UpdateAt = 0
+	scheme.DeleteAt = 0
 
-	scheme, err := c.App.GetScheme(c.Params.SchemeId)
+	scheme, err := a.Srv().Store().Scheme().Save(scheme)
 	if err != nil {
-		c.Err = err
-		return
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("CreateScheme", "app.scheme.save.invalid_scheme.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("CreateScheme", "app.scheme.save.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
-
-	if scheme.Scope != model.SchemeScopeChannel {
-		c.Err = model.NewAppError("Api4.GetChannelsForScheme", "api.scheme.get_channels_for_scheme.scope.error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	channels, err := c.App.GetChannelsForSchemePage(scheme, c.Params.Page, c.Params.PerPage)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(channels); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return scheme, nil
 }
 
-func patchScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireSchemeId()
-	if c.Err != nil {
-		return
+func (a *App) PatchScheme(scheme *model.Scheme, patch *model.SchemePatch) (*model.Scheme, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	var patch model.SchemePatch
-	if jsonErr := json.NewDecoder(r.Body).Decode(&patch); jsonErr != nil {
-		c.SetInvalidParamWithErr("scheme", jsonErr)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("patchScheme", audit.Fail)
-	auditRec.AddEventParameter("scheme_patch", patch)
-	defer c.LogAuditRec(auditRec)
-
-	if c.App.Channels().License() == nil || (!*c.App.Channels().License().Features.CustomPermissionsSchemes && c.App.Channels().License().SkuShortName != model.LicenseShortSkuProfessional) {
-		c.Err = model.NewAppError("Api4.PatchScheme", "api.scheme.patch_scheme.license.error", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	auditRec.AddEventParameter("scheme_id", c.Params.SchemeId)
-
-	scheme, err := c.App.GetScheme(c.Params.SchemeId)
+	scheme.Patch(patch)
+	scheme, err := a.UpdateScheme(scheme)
 	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddEventPriorState(scheme)
-	auditRec.AddEventObjectType("scheme")
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleWriteUserManagementPermissions) {
-		c.SetPermissionError(model.PermissionSysconsoleWriteUserManagementPermissions)
-		return
+		return nil, err
 	}
 
-	scheme, err = c.App.PatchScheme(scheme, &patch)
-	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddEventResultState(scheme)
-
-	auditRec.Success()
-	c.LogAudit("")
-
-	if err := json.NewEncoder(w).Encode(scheme); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return scheme, err
 }
 
-func deleteScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireSchemeId()
-	if c.Err != nil {
-		return
+func (a *App) UpdateScheme(scheme *model.Scheme) (*model.Scheme, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	auditRec := c.MakeAuditRecord("deleteScheme", audit.Fail)
-	auditRec.AddEventParameter("scheme_id", c.Params.SchemeId)
-	defer c.LogAuditRec(auditRec)
-
-	if c.App.Channels().License() == nil || (!*c.App.Channels().License().Features.CustomPermissionsSchemes && c.App.Channels().License().SkuShortName != model.LicenseShortSkuProfessional) {
-		c.Err = model.NewAppError("Api4.DeleteScheme", "api.scheme.delete_scheme.license.error", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleWriteUserManagementPermissions) {
-		c.SetPermissionError(model.PermissionSysconsoleWriteUserManagementPermissions)
-		return
-	}
-
-	scheme, err := c.App.DeleteScheme(c.Params.SchemeId)
+	scheme, err := a.Srv().Store().Scheme().Save(scheme)
 	if err != nil {
-		c.Err = err
-		return
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("UpdateScheme", "app.scheme.save.invalid_scheme.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("UpdateScheme", "app.scheme.save.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+	return scheme, nil
+}
+
+func (a *App) DeleteScheme(schemeId string) (*model.Scheme, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
 	}
 
-	auditRec.AddEventResultState(scheme)
-	auditRec.AddEventObjectType("scheme")
-	auditRec.Success()
+	scheme, err := a.Srv().Store().Scheme().Delete(schemeId)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("DeleteScheme", "app.scheme.get.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("DeleteScheme", "app.scheme.delete.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+	return scheme, nil
+}
 
-	ReturnStatusOK(w)
+func (a *App) GetTeamsForSchemePage(scheme *model.Scheme, page int, perPage int) ([]*model.Team, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
+	}
+
+	return a.GetTeamsForScheme(scheme, page*perPage, perPage)
+}
+
+func (a *App) GetTeamsForScheme(scheme *model.Scheme, offset int, limit int) ([]*model.Team, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
+	}
+
+	teams, err := a.Srv().Store().Team().GetTeamsByScheme(scheme.Id, offset, limit)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamsForScheme", "app.team.get_by_scheme.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return teams, nil
+}
+
+func (a *App) GetChannelsForSchemePage(scheme *model.Scheme, page int, perPage int) (model.ChannelList, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
+	}
+
+	return a.GetChannelsForScheme(scheme, page*perPage, perPage)
+}
+
+func (a *App) GetChannelsForScheme(scheme *model.Scheme, offset int, limit int) (model.ChannelList, *model.AppError) {
+	if err := a.IsPhase2MigrationCompleted(); err != nil {
+		return nil, err
+	}
+
+	channelList, nErr := a.Srv().Store().Channel().GetChannelsByScheme(scheme.Id, offset, limit)
+	if nErr != nil {
+		return nil, model.NewAppError("GetChannelsForScheme", "app.channel.get_by_scheme.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	return channelList, nil
+}
+
+func (s *Server) IsPhase2MigrationCompleted() *model.AppError {
+	if s.phase2PermissionsMigrationComplete {
+		return nil
+	}
+
+	if _, err := s.Store().System().GetByName(model.MigrationKeyAdvancedPermissionsPhase2); err != nil {
+		return model.NewAppError("App.IsPhase2MigrationCompleted", "app.schemes.is_phase_2_migration_completed.not_completed.app_error", nil, "", http.StatusNotImplemented).Wrap(err)
+	}
+
+	s.phase2PermissionsMigrationComplete = true
+
+	return nil
+}
+
+func (a *App) IsPhase2MigrationCompleted() *model.AppError {
+	return a.Srv().IsPhase2MigrationCompleted()
+}
+
+func (a *App) SchemesIterator(scope string, batchSize int) func() []*model.Scheme {
+	offset := 0
+	return func() []*model.Scheme {
+		schemes, err := a.Srv().Store().Scheme().GetAllPage(scope, offset, batchSize)
+		if err != nil {
+			return []*model.Scheme{}
+		}
+		offset += batchSize
+		return schemes
+	}
 }

@@ -1,242 +1,89 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"fmt"
-	"math/rand"
-	"sort"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/mattermost/mattermost-server/v6/app"
 	"github.com/mattermost/mattermost-server/v6/model"
 )
 
-var (
-	rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
-)
-
-func TestGetAllSharedChannels(t *testing.T) {
+func TestApp_CheckCanInviteToSharedChannel(t *testing.T) {
 	th := Setup(t).InitBasic()
-	defer th.TearDown()
 
-	const pages = 3
-	const pageSize = 7
+	channel1 := th.CreateChannel(th.Context, th.BasicTeam)
+	channel2 := th.CreateChannel(th.Context, th.BasicTeam)
+	channel3 := th.CreateChannel(th.Context, th.BasicTeam)
 
-	mockService := app.NewMockRemoteClusterService(nil, app.MockOptionRemoteClusterServiceWithActive(true))
-	th.App.Srv().SetRemoteClusterService(mockService)
+	data := []struct {
+		channelId string
+		home      bool
+		name      string
+		remoteId  string
+	}{
+		{channelId: channel1.Id, home: true, name: "test_home", remoteId: ""},
+		{channelId: channel2.Id, home: false, name: "test_remote", remoteId: model.NewId()},
+	}
 
-	savedIds := make([]string, 0, pages*pageSize)
-
-	// make some shared channels
-	for i := 0; i < pages*pageSize; i++ {
-		channel := th.CreateChannelWithClientAndTeam(th.Client, model.ChannelTypeOpen, th.BasicTeam.Id)
+	for _, d := range data {
 		sc := &model.SharedChannel{
-			ChannelId: channel.Id,
-			TeamId:    channel.TeamId,
-			Home:      randomBool(),
-			ShareName: fmt.Sprintf("test_share_%d", i),
-			CreatorId: th.BasicChannel.CreatorId,
-			RemoteId:  model.NewId(),
+			ChannelId: d.channelId,
+			TeamId:    th.BasicTeam.Id,
+			Home:      d.home,
+			ShareName: d.name,
+			CreatorId: th.BasicUser.Id,
+			RemoteId:  d.remoteId,
 		}
 		_, err := th.App.SaveSharedChannel(th.Context, sc)
 		require.NoError(t, err)
-		savedIds = append(savedIds, channel.Id)
 	}
-	sort.Strings(savedIds)
 
-	t.Run("get shared channels paginated", func(t *testing.T) {
-		channelIds := make([]string, 0, 21)
-		for i := 0; i < pages; i++ {
-			channels, _, err := th.Client.GetAllSharedChannels(th.BasicTeam.Id, i, pageSize)
-			require.NoError(t, err)
-			channelIds = append(channelIds, getIds(channels)...)
-		}
-		sort.Strings(channelIds)
-
-		// ids lists should now match
-		assert.Equal(t, savedIds, channelIds, "id lists should match")
+	t.Run("Test checkChannelNotShared: not yet shared channel", func(t *testing.T) {
+		err := th.App.checkChannelNotShared(th.Context, channel3.Id)
+		assert.NoError(t, err, "unshared channel should not error")
 	})
 
-	t.Run("get shared channels for invalid team", func(t *testing.T) {
-		_, _, err := th.Client.GetAllSharedChannels(model.NewId(), 0, 100)
-		require.Error(t, err)
+	t.Run("Test checkChannelNotShared: already shared channel", func(t *testing.T) {
+		err := th.App.checkChannelNotShared(th.Context, channel1.Id)
+		assert.Error(t, err, "already shared channel should error")
 	})
 
-	t.Run("get shared channels, user not member of team", func(t *testing.T) {
-		team := &model.Team{
-			DisplayName: "tteam",
-			Name:        GenerateTestTeamName(),
-			Type:        model.TeamOpen,
-		}
-		team, _, err := th.SystemAdminClient.CreateTeam(team)
-		require.NoError(t, err)
-
-		_, _, err = th.Client.GetAllSharedChannels(team.Id, 0, 100)
-		require.Error(t, err)
-	})
-}
-
-func getIds(channels []*model.SharedChannel) []string {
-	ids := make([]string, 0, len(channels))
-	for _, c := range channels {
-		ids = append(ids, c.ChannelId)
-	}
-	return ids
-}
-
-func randomBool() bool {
-	return rnd.Intn(2) != 0
-}
-
-func TestGetRemoteClusterById(t *testing.T) {
-	th := Setup(t).InitBasic()
-	defer th.TearDown()
-
-	mockService := app.NewMockRemoteClusterService(nil, app.MockOptionRemoteClusterServiceWithActive(true))
-	th.App.Srv().SetRemoteClusterService(mockService)
-
-	// for this test we need a user that belongs to a channel that
-	// is shared with the requested remote id.
-
-	// create a remote cluster
-	rc := &model.RemoteCluster{
-		RemoteId:     model.NewId(),
-		Name:         "Test1",
-		RemoteTeamId: model.NewId(),
-		SiteURL:      model.NewId(),
-		CreatorId:    model.NewId(),
-	}
-	rc, appErr := th.App.AddRemoteCluster(rc)
-	require.Nil(t, appErr)
-
-	// create a shared channel
-	sc := &model.SharedChannel{
-		ChannelId: th.BasicChannel.Id,
-		TeamId:    th.BasicChannel.TeamId,
-		Home:      false,
-		ShareName: "test_share",
-		CreatorId: th.BasicChannel.CreatorId,
-		RemoteId:  rc.RemoteId,
-	}
-	sc, err := th.App.SaveSharedChannel(th.Context, sc)
-	require.NoError(t, err)
-
-	// create a shared channel remote to connect them
-	scr := &model.SharedChannelRemote{
-		Id:                model.NewId(),
-		ChannelId:         sc.ChannelId,
-		CreatorId:         sc.CreatorId,
-		IsInviteAccepted:  true,
-		IsInviteConfirmed: true,
-		RemoteId:          sc.RemoteId,
-	}
-	_, err = th.App.SaveSharedChannelRemote(scr)
-	require.NoError(t, err)
-
-	t.Run("valid remote, user is member", func(t *testing.T) {
-		rcInfo, _, err := th.Client.GetRemoteClusterInfo(rc.RemoteId)
-		require.NoError(t, err)
-		assert.Equal(t, rc.Name, rcInfo.Name)
+	t.Run("Test checkChannelNotShared: invalid channel", func(t *testing.T) {
+		err := th.App.checkChannelNotShared(th.Context, model.NewId())
+		assert.Error(t, err, "invalid channel should error")
 	})
 
-	t.Run("invalid remote", func(t *testing.T) {
-		_, resp, err := th.Client.GetRemoteClusterInfo(model.NewId())
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+	t.Run("Test checkChannelIsShared: not yet shared channel", func(t *testing.T) {
+		err := th.App.checkChannelIsShared(channel3.Id)
+		assert.Error(t, err, "unshared channel should error")
 	})
 
-}
-
-func TestCreateDirectChannelWithRemoteUser(t *testing.T) {
-	t.Run("creates a local DM channel that is shared", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		client := th.Client
-		defer client.Logout()
-
-		localUser := th.BasicUser
-		remoteUser := th.CreateUser()
-		remoteUser.RemoteId = model.NewString(model.NewId())
-		remoteUser, appErr := th.App.UpdateUser(th.Context, remoteUser, false)
-		require.Nil(t, appErr)
-
-		dm, _, err := client.CreateDirectChannel(localUser.Id, remoteUser.Id)
-		require.NoError(t, err)
-
-		channelName := model.GetDMNameFromIds(localUser.Id, remoteUser.Id)
-		require.Equal(t, channelName, dm.Name, "dm name didn't match")
-		assert.True(t, dm.IsShared())
+	t.Run("Test checkChannelIsShared: already shared channel", func(t *testing.T) {
+		err := th.App.checkChannelIsShared(channel1.Id)
+		assert.NoError(t, err, "already channel should not error")
 	})
 
-	t.Run("sends a shared channel invitation to the remote", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		client := th.Client
-		defer client.Logout()
-
-		mockService := app.NewMockSharedChannelService(nil, app.MockOptionSharedChannelServiceWithActive(true))
-		th.App.Srv().SetSharedChannelSyncService(mockService)
-
-		localUser := th.BasicUser
-		remoteUser := th.CreateUser()
-		rc := &model.RemoteCluster{
-			Name:      "test",
-			Token:     model.NewId(),
-			CreatorId: localUser.Id,
-		}
-		rc, appErr := th.App.AddRemoteCluster(rc)
-		require.Nil(t, appErr)
-
-		remoteUser.RemoteId = model.NewString(rc.RemoteId)
-		remoteUser, appErr = th.App.UpdateUser(th.Context, remoteUser, false)
-		require.Nil(t, appErr)
-
-		dm, _, err := client.CreateDirectChannel(localUser.Id, remoteUser.Id)
-		require.NoError(t, err)
-
-		channelName := model.GetDMNameFromIds(localUser.Id, remoteUser.Id)
-		require.Equal(t, channelName, dm.Name, "dm name didn't match")
-		require.True(t, dm.IsShared())
-
-		assert.Equal(t, 1, mockService.NumInvitations())
+	t.Run("Test checkChannelIsShared: invalid channel", func(t *testing.T) {
+		err := th.App.checkChannelIsShared(model.NewId())
+		assert.Error(t, err, "invalid channel should error")
 	})
 
-	t.Run("does not send a shared channel invitation to the remote when creator is remote", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		client := th.Client
-		defer client.Logout()
+	t.Run("Test CheckCanInviteToSharedChannel: Home shared channel", func(t *testing.T) {
+		err := th.App.CheckCanInviteToSharedChannel(data[0].channelId)
+		assert.NoError(t, err, "home channel should allow invites")
+	})
 
-		mockService := app.NewMockSharedChannelService(nil, app.MockOptionSharedChannelServiceWithActive(true))
-		th.App.Srv().SetSharedChannelSyncService(mockService)
+	t.Run("Test CheckCanInviteToSharedChannel: Remote shared channel", func(t *testing.T) {
+		err := th.App.CheckCanInviteToSharedChannel(data[1].channelId)
+		assert.Error(t, err, "home channel should not allow invites")
+	})
 
-		localUser := th.BasicUser
-		remoteUser := th.CreateUser()
-		rc := &model.RemoteCluster{
-			Name:      "test",
-			Token:     model.NewId(),
-			CreatorId: localUser.Id,
-		}
-		rc, appErr := th.App.AddRemoteCluster(rc)
-		require.Nil(t, appErr)
-
-		remoteUser.RemoteId = model.NewString(rc.RemoteId)
-		remoteUser, appErr = th.App.UpdateUser(th.Context, remoteUser, false)
-		require.Nil(t, appErr)
-
-		dm, _, err := client.CreateDirectChannel(remoteUser.Id, localUser.Id)
-		require.NoError(t, err)
-
-		channelName := model.GetDMNameFromIds(localUser.Id, remoteUser.Id)
-		require.Equal(t, channelName, dm.Name, "dm name didn't match")
-		require.True(t, dm.IsShared())
-
-		assert.Zero(t, mockService.NumInvitations())
+	t.Run("Test CheckCanInviteToSharedChannel: Invalid shared channel", func(t *testing.T) {
+		err := th.App.CheckCanInviteToSharedChannel(model.NewId())
+		assert.Error(t, err, "invalid channel should not allow invites")
 	})
 }

@@ -1,220 +1,290 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"reflect"
+	"strings"
 
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
-	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
+	"github.com/mattermost/mattermost-server/v6/utils"
 )
 
-var notAllowedPermissions = []string{
-	model.PermissionSysconsoleWriteUserManagementSystemRoles.Id,
-	model.PermissionSysconsoleReadUserManagementSystemRoles.Id,
-	model.PermissionManageRoles.Id,
-}
-
-func (api *API) InitRole() {
-	api.BaseRoutes.Roles.Handle("", api.APISessionRequired(getAllRoles)).Methods("GET")
-	api.BaseRoutes.Roles.Handle("/{role_id:[A-Za-z0-9]+}", api.APISessionRequiredTrustRequester(getRole)).Methods("GET")
-	api.BaseRoutes.Roles.Handle("/name/{role_name:[a-z0-9_]+}", api.APISessionRequiredTrustRequester(getRoleByName)).Methods("GET")
-	api.BaseRoutes.Roles.Handle("/names", api.APISessionRequiredTrustRequester(getRolesByNames)).Methods("POST")
-	api.BaseRoutes.Roles.Handle("/{role_id:[A-Za-z0-9]+}/patch", api.APISessionRequired(patchRole)).Methods("PUT")
-}
-
-func getAllRoles(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionManageSystem) {
-		c.SetPermissionError(model.PermissionManageSystem)
-		return
-	}
-
-	roles, appErr := c.App.GetAllRoles()
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(roles)
+func (a *App) GetRole(id string) (*model.Role, *model.AppError) {
+	role, err := a.Srv().Store().Role().Get(id)
 	if err != nil {
-		c.Err = model.NewAppError("getAllRoles", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
-}
-
-func getRole(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireRoleId()
-	if c.Err != nil {
-		return
-	}
-
-	role, err := c.App.GetRole(c.Params.RoleId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(role); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getRoleByName(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireRoleName()
-	if c.Err != nil {
-		return
-	}
-
-	role, err := c.App.GetRoleByName(r.Context(), c.Params.RoleName)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(role); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getRolesByNames(c *Context, w http.ResponseWriter, r *http.Request) {
-	rolenames := model.ArrayFromJSON(r.Body)
-
-	if len(rolenames) == 0 {
-		c.SetInvalidParam("rolenames")
-		return
-	}
-
-	cleanedRoleNames, valid := model.CleanRoleNames(rolenames)
-	if !valid {
-		c.SetInvalidParam("rolename")
-		return
-	}
-
-	roles, appErr := c.App.GetRolesByNames(cleanedRoleNames)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(roles)
-	if err != nil {
-		c.Err = model.NewAppError("getRolesByNames", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
-}
-
-func patchRole(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireRoleId()
-	if c.Err != nil {
-		return
-	}
-
-	var patch model.RolePatch
-	if err := json.NewDecoder(r.Body).Decode(&patch); err != nil {
-		c.SetInvalidParamWithErr("role", err)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("patchRole", audit.Fail)
-	auditRec.AddEventParameter("role_patch", patch)
-	defer c.LogAuditRec(auditRec)
-
-	oldRole, appErr := c.App.GetRole(c.Params.RoleId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-	auditRec.AddEventPriorState(oldRole)
-	auditRec.AddEventObjectType("role")
-
-	// manage_system permission is required to patch system_admin
-	requiredPermission := model.PermissionSysconsoleWriteUserManagementPermissions
-	specialProtectedSystemRoles := append(model.NewSystemRoleIDs, model.SystemAdminRoleId)
-	for _, roleID := range specialProtectedSystemRoles {
-		if oldRole.Name == roleID {
-			requiredPermission = model.PermissionManageSystem
-		}
-	}
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), requiredPermission) {
-		c.SetPermissionError(requiredPermission)
-		return
-	}
-
-	isGuest := oldRole.Name == model.SystemGuestRoleId || oldRole.Name == model.TeamGuestRoleId || oldRole.Name == model.ChannelGuestRoleId
-	if c.App.Channels().License() == nil && patch.Permissions != nil {
-		if isGuest {
-			c.Err = model.NewAppError("Api4.PatchRoles", "api.roles.patch_roles.license.error", nil, "", http.StatusNotImplemented)
-			return
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetRole", "app.role.get.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetRole", "app.role.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
 	}
 
-	// Licensed instances can not change permissions in the blacklist set.
-	if patch.Permissions != nil {
-		deltaPermissions := model.PermissionsChangedByPatch(oldRole, &patch)
+	appErr := a.Srv().mergeChannelHigherScopedPermissions([]*model.Role{role})
+	if appErr != nil {
+		return nil, appErr
+	}
 
-		for _, permission := range deltaPermissions {
-			notAllowed := false
-			for _, notAllowedPermission := range notAllowedPermissions {
-				if permission == notAllowedPermission {
-					notAllowed = true
-				}
-			}
+	return role, nil
+}
 
-			if notAllowed {
-				c.Err = model.NewAppError("Api4.PatchRoles", "api.roles.patch_roles.not_allowed_permission.error", nil, "Cannot add or remove permission: "+permission, http.StatusNotImplemented)
-				return
+func (a *App) GetAllRoles() ([]*model.Role, *model.AppError) {
+	roles, err := a.Srv().Store().Role().GetAll()
+	if err != nil {
+		return nil, model.NewAppError("GetAllRoles", "app.role.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	appErr := a.Srv().mergeChannelHigherScopedPermissions(roles)
+	if appErr != nil {
+		return nil, appErr
+	}
+
+	return roles, nil
+}
+
+func (s *Server) GetRoleByName(ctx context.Context, name string) (*model.Role, *model.AppError) {
+	role, nErr := s.Store().Role().GetByName(ctx, name)
+	if nErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(nErr, &nfErr):
+			return nil, model.NewAppError("GetRoleByName", "app.role.get_by_name.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
+		default:
+			return nil, model.NewAppError("GetRoleByName", "app.role.get_by_name.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	err := s.mergeChannelHigherScopedPermissions([]*model.Role{role})
+	if err != nil {
+		return nil, err
+	}
+
+	return role, nil
+}
+
+func (a *App) GetRoleByName(ctx context.Context, name string) (*model.Role, *model.AppError) {
+	return a.Srv().GetRoleByName(ctx, name)
+}
+
+func (a *App) GetRolesByNames(names []string) ([]*model.Role, *model.AppError) {
+	roles, nErr := a.Srv().Store().Role().GetByNames(names)
+	if nErr != nil {
+		return nil, model.NewAppError("GetRolesByNames", "app.role.get_by_names.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	err := a.mergeChannelHigherScopedPermissions(roles)
+	if err != nil {
+		return nil, err
+	}
+
+	return roles, nil
+}
+
+// mergeChannelHigherScopedPermissions updates the permissions based on the role type, whether the permission is
+// moderated, and the value of the permission on the higher-scoped scheme.
+func (s *Server) mergeChannelHigherScopedPermissions(roles []*model.Role) *model.AppError {
+	var higherScopeNamesToQuery []string
+
+	for _, role := range roles {
+		if role.SchemeManaged {
+			higherScopeNamesToQuery = append(higherScopeNamesToQuery, role.Name)
+		}
+	}
+
+	if len(higherScopeNamesToQuery) == 0 {
+		return nil
+	}
+
+	higherScopedPermissionsMap, err := s.Store().Role().ChannelHigherScopedPermissions(higherScopeNamesToQuery)
+	if err != nil {
+		return model.NewAppError("mergeChannelHigherScopedPermissions", "app.role.get_by_names.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, role := range roles {
+		if role.SchemeManaged {
+			if higherScopedPermissions, ok := higherScopedPermissionsMap[role.Name]; ok {
+				role.MergeChannelHigherScopedPermissions(higherScopedPermissions)
 			}
 		}
-
-		*patch.Permissions = model.RemoveDuplicateStrings(*patch.Permissions)
 	}
 
-	if c.App.Channels().License() != nil && isGuest && !*c.App.Channels().License().Features.GuestAccountsPermissions {
-		c.Err = model.NewAppError("Api4.PatchRoles", "api.roles.patch_roles.license.error", nil, "", http.StatusNotImplemented)
-		return
+	return nil
+}
+
+// mergeChannelHigherScopedPermissions updates the permissions based on the role type, whether the permission is
+// moderated, and the value of the permission on the higher-scoped scheme.
+func (a *App) mergeChannelHigherScopedPermissions(roles []*model.Role) *model.AppError {
+	return a.Srv().mergeChannelHigherScopedPermissions(roles)
+}
+
+func (a *App) PatchRole(role *model.Role, patch *model.RolePatch) (*model.Role, *model.AppError) {
+	// If patch is a no-op then short-circuit the store.
+	if patch.Permissions != nil && reflect.DeepEqual(*patch.Permissions, role.Permissions) {
+		return role, nil
 	}
 
-	if oldRole.Name == model.TeamAdminRoleId ||
-		oldRole.Name == model.ChannelAdminRoleId ||
-		oldRole.Name == model.SystemUserRoleId ||
-		oldRole.Name == model.TeamUserRoleId ||
-		oldRole.Name == model.ChannelUserRoleId ||
-		oldRole.Name == model.SystemGuestRoleId ||
-		oldRole.Name == model.TeamGuestRoleId ||
-		oldRole.Name == model.ChannelGuestRoleId ||
-		oldRole.Name == model.PlaybookAdminRoleId ||
-		oldRole.Name == model.PlaybookMemberRoleId ||
-		oldRole.Name == model.RunAdminRoleId ||
-		oldRole.Name == model.RunMemberRoleId {
-		if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleWriteUserManagementPermissions) {
-			c.SetPermissionError(model.PermissionSysconsoleWriteUserManagementPermissions)
-			return
+	role.Patch(patch)
+	role, err := a.UpdateRole(role)
+	if err != nil {
+		return nil, err
+	}
+
+	if appErr := a.sendUpdatedRoleEvent(role); appErr != nil {
+		return nil, appErr
+	}
+
+	return role, err
+}
+
+func (a *App) CreateRole(role *model.Role) (*model.Role, *model.AppError) {
+	role.Id = ""
+	role.CreateAt = 0
+	role.UpdateAt = 0
+	role.DeleteAt = 0
+	role.BuiltIn = false
+	role.SchemeManaged = false
+
+	var err error
+	role, err = a.Srv().Store().Role().Save(role)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		switch {
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("CreateRole", "app.role.save.invalid_role.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("CreateRole", "app.role.save.insert.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return role, nil
+}
+
+func (a *App) UpdateRole(role *model.Role) (*model.Role, *model.AppError) {
+	savedRole, err := a.Srv().Store().Role().Save(role)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		switch {
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("UpdateRole", "app.role.save.invalid_role.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("UpdateRole", "app.role.save.insert.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	builtInChannelRoles := []string{
+		model.ChannelGuestRoleId,
+		model.ChannelUserRoleId,
+		model.ChannelAdminRoleId,
+	}
+
+	builtInRolesMinusChannelRoles := append(utils.RemoveStringsFromSlice(model.BuiltInSchemeManagedRoleIDs, builtInChannelRoles...), model.NewSystemRoleIDs...)
+
+	if utils.StringInSlice(savedRole.Name, builtInRolesMinusChannelRoles) {
+		return savedRole, nil
+	}
+
+	var roleRetrievalFunc func() ([]*model.Role, *model.AppError)
+
+	if utils.StringInSlice(savedRole.Name, builtInChannelRoles) {
+		roleRetrievalFunc = func() ([]*model.Role, *model.AppError) {
+			roles, nErr := a.Srv().Store().Role().AllChannelSchemeRoles()
+			if nErr != nil {
+				return nil, model.NewAppError("UpdateRole", "app.role.get.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+			}
+
+			return roles, nil
 		}
 	} else {
-		if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleWriteUserManagementSystemRoles) {
-			c.SetPermissionError(model.PermissionSysconsoleWriteUserManagementSystemRoles)
-			return
+		roleRetrievalFunc = func() ([]*model.Role, *model.AppError) {
+			roles, nErr := a.Srv().Store().Role().ChannelRolesUnderTeamRole(savedRole.Name)
+			if nErr != nil {
+				return nil, model.NewAppError("UpdateRole", "app.role.get.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+			}
+
+			return roles, nil
 		}
 	}
 
-	role, appErr := c.App.PatchRole(oldRole, &patch)
+	impactedRoles, appErr := roleRetrievalFunc()
 	if appErr != nil {
-		c.Err = appErr
-		return
+		return nil, appErr
+	}
+	impactedRoles = append(impactedRoles, role)
+
+	appErr = a.mergeChannelHigherScopedPermissions(impactedRoles)
+	if appErr != nil {
+		return nil, appErr
 	}
 
-	auditRec.AddEventResultState(role)
-	auditRec.Success()
-	c.LogAudit("")
-
-	if err := json.NewEncoder(w).Encode(role); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
+	for _, ir := range impactedRoles {
+		if ir.Name != role.Name {
+			appErr = a.sendUpdatedRoleEvent(ir)
+			if appErr != nil {
+				return nil, appErr
+			}
+		}
 	}
+
+	return savedRole, nil
+}
+
+func (a *App) CheckRolesExist(roleNames []string) *model.AppError {
+	roles, err := a.GetRolesByNames(roleNames)
+	if err != nil {
+		return err
+	}
+
+	for _, name := range roleNames {
+		nameFound := false
+		for _, role := range roles {
+			if name == role.Name {
+				nameFound = true
+				break
+			}
+		}
+		if !nameFound {
+			return model.NewAppError("CheckRolesExist", "app.role.check_roles_exist.role_not_found", nil, "role="+name, http.StatusBadRequest)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) sendUpdatedRoleEvent(role *model.Role) *model.AppError {
+	message := model.NewWebSocketEvent(model.WebsocketEventRoleUpdated, "", "", "", nil, "")
+	roleJSON, jsonErr := json.Marshal(role)
+	if jsonErr != nil {
+		return model.NewAppError("sendUpdatedRoleEvent", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(jsonErr)
+	}
+	message.Add("role", string(roleJSON))
+	a.Publish(message)
+	return nil
+}
+
+func RemoveRoles(rolesToRemove []string, roles string) string {
+	roleList := strings.Fields(roles)
+	newRoles := make([]string, 0)
+
+	for _, role := range roleList {
+		shouldRemove := false
+		for _, roleToRemove := range rolesToRemove {
+			if role == roleToRemove {
+				shouldRemove = true
+				break
+			}
+		}
+		if !shouldRemove {
+			newRoles = append(newRoles, role)
+		}
+	}
+
+	return strings.Join(newRoles, " ")
 }

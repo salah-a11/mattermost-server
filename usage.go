@@ -1,74 +1,58 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/mattermost/mattermost-server/v6/model"
 	"github.com/mattermost/mattermost-server/v6/utils"
 )
 
-func (api *API) InitUsage() {
-	// GET /api/v4/usage/posts
-	api.BaseRoutes.Usage.Handle("/posts", api.APISessionRequired(getPostsUsage)).Methods("GET")
-	// GET /api/v4/usage/storage
-	api.BaseRoutes.Usage.Handle("/storage", api.APISessionRequired(getStorageUsage)).Methods("GET")
-	// GET /api/v4/usage/teams
-	api.BaseRoutes.Usage.Handle("/teams", api.APISessionRequired(getTeamsUsage)).Methods("GET")
+// GetPostsUsage returns the total posts count rounded down to the most
+// significant digit
+func (a *App) GetPostsUsage() (int64, *model.AppError) {
+	count, err := a.Srv().Store().Post().AnalyticsPostCount(&model.PostCountOptions{ExcludeDeleted: true, UsersPostsOnly: true, AllowFromCache: true})
+	if err != nil {
+		return 0, model.NewAppError("GetPostsUsage", "app.post.analytics_posts_count.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return utils.RoundOffToZeroesResolution(float64(count), 3), nil
 }
 
-func getPostsUsage(c *Context, w http.ResponseWriter, r *http.Request) {
-	count, appErr := c.App.GetPostsUsage()
-	if appErr != nil {
-		c.Err = model.NewAppError("Api4.getPostsUsage", "app.post.analytics_posts_count.app_error", nil, "", http.StatusInternalServerError).Wrap(appErr)
-		return
-	}
-
-	json, err := json.Marshal(&model.PostsUsage{Count: count})
+// GetStorageUsage returns the sum of files' sizes stored on this instance
+func (a *App) GetStorageUsage() (int64, *model.AppError) {
+	usage, err := a.Srv().Store().FileInfo().GetStorageUsage(true, false)
 	if err != nil {
-		c.Err = model.NewAppError("Api4.getPostsUsage", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return 0, model.NewAppError("GetStorageUsage", "app.usage.get_storage_usage.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
-
-	w.Write(json)
+	return usage, nil
 }
 
-func getStorageUsage(c *Context, w http.ResponseWriter, r *http.Request) {
-	usage, appErr := c.App.GetStorageUsage()
-	if appErr != nil {
-		c.Err = model.NewAppError("Api4.getStorageUsage", "app.usage.get_storage_usage.app_error", nil, "", http.StatusInternalServerError).Wrap(appErr)
-		return
-	}
-
-	usage = utils.RoundOffToZeroesResolution(float64(usage), 8)
-	json, err := json.Marshal(&model.StorageUsage{Bytes: usage})
+func (a *App) GetTeamsUsage() (*model.TeamsUsage, *model.AppError) {
+	usage := &model.TeamsUsage{}
+	includeDeleted := false
+	teamCount, err := a.Srv().Store().Team().AnalyticsTeamCount(&model.TeamSearch{IncludeDeleted: &includeDeleted})
 	if err != nil {
-		c.Err = model.NewAppError("Api4.getStorageUsage", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return nil, model.NewAppError("GetTeamsUsage", "app.post.analytics_teams_count.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	w.Write(json)
-}
+	usage.Active = teamCount
 
-func getTeamsUsage(c *Context, w http.ResponseWriter, r *http.Request) {
-	teamsUsage, appErr := c.App.GetTeamsUsage()
+	allTeams, appErr := a.GetAllTeams()
 	if appErr != nil {
-		c.Err = model.NewAppError("Api4.getTeamsUsage", "app.teams.analytics_teams_count.app_error", nil, "", http.StatusInternalServerError).Wrap(appErr)
-		return
+		return nil, appErr
 	}
 
-	if teamsUsage == nil {
-		c.Err = model.NewAppError("Api4.getTeamsUsage", "app.teams.analytics_teams_count.app_error", nil, "", http.StatusInternalServerError).Wrap(appErr)
+	cloudArchivedTeamCount := 0
+
+	for _, team := range allTeams {
+		if team.DeleteAt > 0 && team.CloudLimitsArchived {
+			cloudArchivedTeamCount += 1
+		}
 	}
 
-	json, err := json.Marshal(teamsUsage)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getTeamsUsage", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(json)
+	usage.CloudArchived = int64(cloudArchivedTeamCount)
+	return usage, nil
 }

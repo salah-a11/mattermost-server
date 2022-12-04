@@ -1,1844 +1,2156 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
 	"bytes"
-	"encoding/base64"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"image"
 	"io"
+	"mime/multipart"
 	"net/http"
-	"regexp"
-	"strconv"
+	"net/url"
+	"sort"
 	"strings"
 
-	"github.com/mattermost/mattermost-server/v6/audit"
+	"github.com/mattermost/mattermost-server/v6/app/email"
+	"github.com/mattermost/mattermost-server/v6/app/imaging"
+	"github.com/mattermost/mattermost-server/v6/app/request"
+	"github.com/mattermost/mattermost-server/v6/app/teams"
+	"github.com/mattermost/mattermost-server/v6/app/users"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/plugin"
+	"github.com/mattermost/mattermost-server/v6/product"
+	"github.com/mattermost/mattermost-server/v6/shared/i18n"
 	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
+	"github.com/mattermost/mattermost-server/v6/store/sqlstore"
 )
 
-const (
-	MaxAddMembersBatch    = 256
-	MaximumBulkImportSize = 10 * 1024 * 1024
-	groupIDsParamPattern  = "[^a-zA-Z0-9,]*"
-)
-
-var groupIDsQueryParamRegex *regexp.Regexp
-
-func init() {
-	groupIDsQueryParamRegex = regexp.MustCompile(groupIDsParamPattern)
+// teamServiceWrapper provides an implementation of `product.TeamService` to be used by products.
+type teamServiceWrapper struct {
+	app AppIface
 }
 
-func (api *API) InitTeam() {
-	api.BaseRoutes.Teams.Handle("", api.APISessionRequired(createTeam)).Methods("POST")
-	api.BaseRoutes.Teams.Handle("", api.APISessionRequired(getAllTeams)).Methods("GET")
-	api.BaseRoutes.Teams.Handle("/{team_id:[A-Za-z0-9]+}/scheme", api.APISessionRequired(updateTeamScheme)).Methods("PUT")
-	api.BaseRoutes.Teams.Handle("/search", api.APISessionRequiredDisableWhenBusy(searchTeams)).Methods("POST")
-	api.BaseRoutes.TeamsForUser.Handle("", api.APISessionRequired(getTeamsForUser)).Methods("GET")
-	api.BaseRoutes.TeamsForUser.Handle("/unread", api.APISessionRequired(getTeamsUnreadForUser)).Methods("GET")
-
-	api.BaseRoutes.Team.Handle("", api.APISessionRequired(getTeam)).Methods("GET")
-	api.BaseRoutes.Team.Handle("", api.APISessionRequired(updateTeam)).Methods("PUT")
-	api.BaseRoutes.Team.Handle("", api.APISessionRequired(deleteTeam)).Methods("DELETE")
-	api.BaseRoutes.Team.Handle("/except", api.APISessionRequired(softDeleteTeamsExcept)).Methods("DELETE")
-	api.BaseRoutes.Team.Handle("/patch", api.APISessionRequired(patchTeam)).Methods("PUT")
-	api.BaseRoutes.Team.Handle("/restore", api.APISessionRequired(restoreTeam)).Methods("POST")
-	api.BaseRoutes.Team.Handle("/privacy", api.APISessionRequired(updateTeamPrivacy)).Methods("PUT")
-	api.BaseRoutes.Team.Handle("/stats", api.APISessionRequired(getTeamStats)).Methods("GET")
-	api.BaseRoutes.Team.Handle("/regenerate_invite_id", api.APISessionRequired(regenerateTeamInviteId)).Methods("POST")
-
-	api.BaseRoutes.Team.Handle("/image", api.APISessionRequiredTrustRequester(getTeamIcon)).Methods("GET")
-	api.BaseRoutes.Team.Handle("/image", api.APISessionRequired(setTeamIcon)).Methods("POST")
-	api.BaseRoutes.Team.Handle("/image", api.APISessionRequired(removeTeamIcon)).Methods("DELETE")
-
-	api.BaseRoutes.TeamMembers.Handle("", api.APISessionRequired(getTeamMembers)).Methods("GET")
-	api.BaseRoutes.TeamMembers.Handle("/ids", api.APISessionRequired(getTeamMembersByIds)).Methods("POST")
-	api.BaseRoutes.TeamMembersForUser.Handle("", api.APISessionRequired(getTeamMembersForUser)).Methods("GET")
-	api.BaseRoutes.TeamMembers.Handle("", api.APISessionRequired(addTeamMember)).Methods("POST")
-	api.BaseRoutes.Teams.Handle("/members/invite", api.APISessionRequired(addUserToTeamFromInvite)).Methods("POST")
-	api.BaseRoutes.TeamMembers.Handle("/batch", api.APISessionRequired(addTeamMembers)).Methods("POST")
-	api.BaseRoutes.TeamMember.Handle("", api.APISessionRequired(removeTeamMember)).Methods("DELETE")
-
-	api.BaseRoutes.TeamForUser.Handle("/unread", api.APISessionRequired(getTeamUnread)).Methods("GET")
-
-	api.BaseRoutes.TeamByName.Handle("", api.APISessionRequired(getTeamByName)).Methods("GET")
-	api.BaseRoutes.TeamMember.Handle("", api.APISessionRequired(getTeamMember)).Methods("GET")
-	api.BaseRoutes.TeamByName.Handle("/exists", api.APISessionRequired(teamExists)).Methods("GET")
-	api.BaseRoutes.TeamMember.Handle("/roles", api.APISessionRequired(updateTeamMemberRoles)).Methods("PUT")
-	api.BaseRoutes.TeamMember.Handle("/schemeRoles", api.APISessionRequired(updateTeamMemberSchemeRoles)).Methods("PUT")
-	api.BaseRoutes.Team.Handle("/import", api.APISessionRequired(importTeam)).Methods("POST")
-	api.BaseRoutes.Team.Handle("/invite/email", api.APISessionRequired(inviteUsersToTeam)).Methods("POST")
-	api.BaseRoutes.Team.Handle("/invite-guests/email", api.APISessionRequired(inviteGuestsToChannels)).Methods("POST")
-	api.BaseRoutes.Teams.Handle("/invites/email", api.APISessionRequired(invalidateAllEmailInvites)).Methods("DELETE")
-	api.BaseRoutes.Teams.Handle("/invite/{invite_id:[A-Za-z0-9]+}", api.APIHandler(getInviteInfo)).Methods("GET")
-
-	api.BaseRoutes.Teams.Handle("/{team_id:[A-Za-z0-9]+}/members_minus_group_members", api.APISessionRequired(teamMembersMinusGroupMembers)).Methods("GET")
+func (w *teamServiceWrapper) GetMember(teamID, userID string) (*model.TeamMember, *model.AppError) {
+	return w.app.GetTeamMember(teamID, userID)
 }
 
-func createTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	var team model.Team
-	if jsonErr := json.NewDecoder(r.Body).Decode(&team); jsonErr != nil {
-		c.SetInvalidParamWithErr("team", jsonErr)
-		return
-	}
-	team.Email = strings.ToLower(team.Email)
+func (w *teamServiceWrapper) CreateMember(ctx *request.Context, teamID, userID string) (*model.TeamMember, *model.AppError) {
+	return w.app.AddTeamMember(ctx, teamID, userID)
+}
 
-	auditRec := c.MakeAuditRecord("createTeam", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team", team)
+// Ensure the wrapper implements the product service.
+var _ product.TeamService = (*teamServiceWrapper)(nil)
 
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionCreateTeam) {
-		c.Err = model.NewAppError("createTeam", "api.team.is_team_creation_allowed.disabled.app_error", nil, "", http.StatusForbidden)
-		return
+func (a *App) AdjustTeamsFromProductLimits(teamLimits *model.TeamsLimits) *model.AppError {
+	maxActiveTeams := *teamLimits.Active
+	teams, appErr := a.GetAllTeams()
+	if appErr != nil {
+		return appErr
 	}
 
-	// On a cloud license, we must check limits before allowing to create
-	if c.App.Channels().License().IsCloud() {
-		limits, err := c.App.Cloud().GetCloudLimits(c.AppContext.Session().UserId)
+	if teams == nil {
+		return nil
+	}
+	// Sort the list of teams based on their creation date
+	sort.Slice(teams, func(i, j int) bool {
+		return teams[i].CreateAt < teams[j].CreateAt
+	})
+
+	var activeTeams []*model.Team
+	var cloudArchivedTeams []*model.Team
+	for _, team := range teams {
+		if team.DeleteAt == 0 {
+			activeTeams = append(activeTeams, team)
+		}
+		if team.DeleteAt > 0 && team.CloudLimitsArchived {
+			cloudArchivedTeams = append(cloudArchivedTeams, team)
+		}
+	}
+
+	if len(activeTeams) > maxActiveTeams {
+		// If there are more active teams than allowed, we must archive them
+		// Remove the first n elements (where n is the allowed number of teams) so they aren't archived
+
+		teamsToArchive := activeTeams[maxActiveTeams:]
+
+		for _, team := range teamsToArchive {
+			cloudLimitsArchived := true
+			// Archive the remainder
+			patch := model.TeamPatch{CloudLimitsArchived: &cloudLimitsArchived}
+			_, err := a.PatchTeam(team.Id, &patch)
+			if err != nil {
+				return err
+			}
+			err = a.SoftDeleteTeam(team.Id)
+			if err != nil {
+				return err
+			}
+		}
+	} else if len(activeTeams) < maxActiveTeams && len(cloudArchivedTeams) > 0 {
+		// If the number of activeTeams is less than the allowed limit, and there are some cloudArchivedTeams, we can restore these cloudArchivedTeams
+		activeTeamsBeforeLimit := maxActiveTeams - len(activeTeams)
+		teamsToRestore := cloudArchivedTeams
+		// If the number of active teams remaining before the limit is hit is fewer than the number of cloudArchivedTeams, trim the list (still according to CreateAt)
+		// Otherwise, we can restore all of the cloudArchivedTeams without hitting the limit, so don't filter the list
+		if activeTeamsBeforeLimit < len(cloudArchivedTeams) {
+			teamsToRestore = cloudArchivedTeams[:(activeTeamsBeforeLimit)]
+		}
+
+		cloudLimitsArchived := false
+		patch := &model.TeamPatch{CloudLimitsArchived: &cloudLimitsArchived}
+		for _, team := range teamsToRestore {
+			err := a.RestoreTeam(team.Id)
+			if err != nil {
+				return err
+			}
+
+			_, err = a.PatchTeam(team.Id, patch)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+func (a *App) SoftDeleteAllTeamsExcept(teamID string) *model.AppError {
+	teams, appErr := a.GetAllTeams()
+	if appErr != nil {
+		return appErr
+	}
+
+	if teams == nil {
+		return nil
+	}
+	cloudLimitsArchived := true
+	patch := &model.TeamPatch{CloudLimitsArchived: &cloudLimitsArchived}
+	for _, team := range teams {
+		if team.Id != teamID {
+			_, err := a.PatchTeam(team.Id, patch)
+			if err != nil {
+				return err
+			}
+
+			err = a.SoftDeleteTeam(team.Id)
+			if err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (a *App) CreateTeam(c request.CTX, team *model.Team) (*model.Team, *model.AppError) {
+	rteam, err := a.ch.srv.teamService.CreateTeam(team)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+
+		var cErr *store.ErrConflict
+		var ltErr *store.ErrLimitExceeded
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &invErr):
+			switch {
+			case invErr.Entity == "Channel" && invErr.Field == "DeleteAt":
+				return nil, model.NewAppError("CreateTeam", "store.sql_channel.save.archived_channel.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+			case invErr.Entity == "Channel" && invErr.Field == "Type":
+				return nil, model.NewAppError("CreateTeam", "store.sql_channel.save.direct_channel.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+			case invErr.Entity == "Channel" && invErr.Field == "Id":
+				return nil, model.NewAppError("CreateTeam", "store.sql_channel.save_channel.existing.app_error", nil, "id="+invErr.Value.(string), http.StatusBadRequest).Wrap(err)
+			default:
+				return nil, model.NewAppError("CreateTeam", "app.team.save.existing.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+			}
+		case errors.As(err, &cErr):
+			return nil, model.NewAppError("CreateTeam", store.ChannelExistsError, nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &ltErr):
+			return nil, model.NewAppError("CreateTeam", "store.sql_channel.save_channel.limit.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("CreateTeam", "app.team.save.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return rteam, nil
+}
+
+func (a *App) CreateTeamWithUser(c *request.Context, team *model.Team, userID string) (*model.Team, *model.AppError) {
+	user, err := a.GetUser(userID)
+	if err != nil {
+		return nil, err
+	}
+	team.Email = user.Email
+
+	if !a.ch.srv.teamService.IsTeamEmailAllowed(user, team) {
+		return nil, model.NewAppError("CreateTeamWithUser", "api.team.is_team_creation_allowed.domain.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	rteam, err := a.CreateTeam(c, team)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err := a.JoinUserToTeam(c, rteam, user, ""); err != nil {
+		return nil, err
+	}
+
+	return rteam, nil
+}
+
+func (a *App) normalizeDomains(domains string) []string {
+	// commas and @ signs are optional
+	// can be in the form of "@corp.mattermost.com, mattermost.com mattermost.org" -> corp.mattermost.com mattermost.com mattermost.org
+	return strings.Fields(strings.TrimSpace(strings.ToLower(strings.Replace(strings.Replace(domains, "@", " ", -1), ",", " ", -1))))
+}
+
+func (a *App) UpdateTeam(team *model.Team) (*model.Team, *model.AppError) {
+	oldTeam, err := a.ch.srv.teamService.UpdateTeam(team, teams.UpdateOptions{Sanitized: true})
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		var domErr *teams.DomainError
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("UpdateTeam", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("UpdateTeam", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &domErr):
+			return nil, model.NewAppError("UpdateTeam", "api.team.update_restricted_domains.mismatch.app_error", map[string]any{"Domain": domErr.Domain}, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("UpdateTeam", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	if appErr := a.sendTeamEvent(oldTeam, model.WebsocketEventUpdateTeam); appErr != nil {
+		return nil, appErr
+	}
+
+	return oldTeam, nil
+}
+
+// RenameTeam is used to rename the team Name and the DisplayName fields
+func (a *App) RenameTeam(team *model.Team, newTeamName string, newDisplayName string) (*model.Team, *model.AppError) {
+
+	// check if name is occupied
+	_, errnf := a.GetTeamByName(newTeamName)
+
+	// "-" can be used as a newTeamName if only DisplayName change is wanted
+	if errnf == nil && newTeamName != "-" {
+		errbody := fmt.Sprintf("team with name %s already exists", newTeamName)
+		return nil, model.NewAppError("RenameTeam", "app.team.rename_team.name_occupied", nil, errbody, http.StatusBadRequest)
+	}
+
+	if newTeamName != "-" {
+		team.Name = newTeamName
+	}
+
+	if newDisplayName != "" {
+		team.DisplayName = newDisplayName
+	}
+
+	newTeam, err := a.ch.srv.teamService.UpdateTeam(team, teams.UpdateOptions{})
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		var domErr *teams.DomainError
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("RenameTeam", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("RenameTeam", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &domErr):
+			return nil, model.NewAppError("RenameTeam", "api.team.update_restricted_domains.mismatch.app_error", map[string]any{"Domain": domErr.Domain}, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("RenameTeam", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return newTeam, nil
+}
+
+func (a *App) UpdateTeamScheme(team *model.Team) (*model.Team, *model.AppError) {
+	oldTeam, err := a.GetTeam(team.Id)
+	if err != nil {
+		return nil, err
+	}
+
+	oldTeam.SchemeId = team.SchemeId
+
+	oldTeam, nErr := a.Srv().Store().Team().Update(oldTeam)
+	if nErr != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &invErr):
+			return nil, model.NewAppError("UpdateTeamScheme", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(nErr)
+		case errors.As(nErr, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("UpdateTeamScheme", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	nErr = a.ClearTeamMembersCache(team.Id)
+	if nErr != nil {
+		return nil, model.NewAppError("UpdateTeamScheme", "app.team.clear_cache.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+	}
+
+	a.Srv().Store().Channel().ClearMembersForUserCache()
+
+	if appErr := a.sendTeamEvent(oldTeam, model.WebsocketEventUpdateTeamScheme); appErr != nil {
+		return nil, appErr
+	}
+
+	return oldTeam, nil
+}
+
+func (a *App) UpdateTeamPrivacy(teamID string, teamType string, allowOpenInvite bool) *model.AppError {
+	oldTeam, err := a.GetTeam(teamID)
+	if err != nil {
+		return err
+	}
+
+	// Force a regeneration of the invite token if changing a team to restricted.
+	if (allowOpenInvite != oldTeam.AllowOpenInvite || teamType != oldTeam.Type) && (!allowOpenInvite || teamType == model.TeamInvite) {
+		oldTeam.InviteId = model.NewId()
+	}
+
+	oldTeam.Type = teamType
+	oldTeam.AllowOpenInvite = allowOpenInvite
+
+	oldTeam, nErr := a.Srv().Store().Team().Update(oldTeam)
+	if nErr != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &invErr):
+			return model.NewAppError("UpdateTeamPrivacy", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(nErr)
+		case errors.As(nErr, &appErr):
+			return appErr
+		default:
+			return model.NewAppError("UpdateTeamPrivacy", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	if appErr := a.sendTeamEvent(oldTeam, model.WebsocketEventUpdateTeam); appErr != nil {
+		return appErr
+	}
+
+	return nil
+}
+
+func (a *App) PatchTeam(teamID string, patch *model.TeamPatch) (*model.Team, *model.AppError) {
+	team, err := a.ch.srv.teamService.PatchTeam(teamID, patch)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		var domErr *teams.DomainError
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("PatchTeam", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("PatchTeam", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &domErr):
+			return nil, model.NewAppError("PatchTeam", "api.team.update_restricted_domains.mismatch.app_error", map[string]any{"Domain": domErr.Domain}, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("PatchTeam", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	if appErr := a.sendTeamEvent(team, model.WebsocketEventUpdateTeam); appErr != nil {
+		return nil, appErr
+	}
+
+	return team, nil
+}
+
+func (a *App) RegenerateTeamInviteId(teamID string) (*model.Team, *model.AppError) {
+	team, err := a.GetTeam(teamID)
+	if err != nil {
+		return nil, err
+	}
+
+	team.InviteId = model.NewId()
+
+	updatedTeam, nErr := a.Srv().Store().Team().Update(team)
+	if nErr != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &invErr):
+			return nil, model.NewAppError("RegenerateTeamInviteId", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(nErr)
+		case errors.As(nErr, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("RegenerateTeamInviteId", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	if appErr := a.sendTeamEvent(updatedTeam, model.WebsocketEventUpdateTeam); appErr != nil {
+		return nil, appErr
+	}
+
+	return updatedTeam, nil
+}
+
+func (a *App) sendTeamEvent(team *model.Team, event string) *model.AppError {
+	sanitizedTeam := &model.Team{}
+	*sanitizedTeam = *team
+	sanitizedTeam.Sanitize()
+
+	teamID := "" // no filtering by teamID by default
+	if event == model.WebsocketEventUpdateTeam {
+		// in case of update_team event - we send the message only to members of that team
+		teamID = team.Id
+	}
+	message := model.NewWebSocketEvent(event, teamID, "", "", nil, "")
+	teamJSON, jsonErr := json.Marshal(team)
+	if jsonErr != nil {
+		return model.NewAppError("sendTeamEvent", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(jsonErr)
+	}
+	message.Add("team", string(teamJSON))
+	a.Publish(message)
+	return nil
+}
+
+func (a *App) GetSchemeRolesForTeam(teamID string) (string, string, string, *model.AppError) {
+	team, err := a.GetTeam(teamID)
+	if err != nil {
+		return "", "", "", err
+	}
+
+	if team.SchemeId != nil && *team.SchemeId != "" {
+		scheme, err := a.GetScheme(*team.SchemeId)
 		if err != nil {
-			c.Err = model.NewAppError("Api4.createTeam", "api.cloud.app_error", nil, err.Error(), http.StatusInternalServerError)
-			return
+			return "", "", "", err
 		}
+		return scheme.DefaultTeamGuestRole, scheme.DefaultTeamUserRole, scheme.DefaultTeamAdminRole, nil
+	}
 
-		// If there are no limits for teams, for active teams, or the limit for active teams is less than 0, do nothing
-		if !(limits == nil || limits.Teams == nil || limits.Teams.Active == nil || *limits.Teams.Active <= 0) {
-			teamsUsage, appErr := c.App.GetTeamsUsage()
-			if appErr != nil {
-				c.Err = appErr
-				return
-			}
-			// if the number of active teams is greater than or equal to the limit, return 400
-			if teamsUsage.Active >= int64(*limits.Teams.Active) {
-				c.Err = model.NewAppError("Api4.createTeam", "api.cloud.teams_limit_reached.create", nil, "", http.StatusBadRequest)
-				return
-			}
+	return model.TeamGuestRoleId, model.TeamUserRoleId, model.TeamAdminRoleId, nil
+}
+
+func (a *App) UpdateTeamMemberRoles(teamID string, userID string, newRoles string) (*model.TeamMember, *model.AppError) {
+	member, nErr := a.Srv().Store().Team().GetMember(context.Background(), teamID, userID)
+	if nErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(nErr, &nfErr):
+			return nil, model.NewAppError("UpdateTeamMemberRoles", "app.team.get_member.missing.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
+		default:
+			return nil, model.NewAppError("UpdateTeamMemberRoles", "app.team.get_member.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
 		}
 	}
 
-	rteam, err := c.App.CreateTeamWithUser(c.AppContext, &team, c.AppContext.Session().UserId)
+	if member == nil {
+		return nil, model.NewAppError("UpdateTeamMemberRoles", "api.team.update_member_roles.not_a_member", nil, "userId="+userID+" teamId="+teamID, http.StatusBadRequest)
+	}
+
+	schemeGuestRole, schemeUserRole, schemeAdminRole, err := a.GetSchemeRolesForTeam(teamID)
 	if err != nil {
-		c.Err = err
-		return
+		return nil, err
 	}
 
-	// Don't sanitize the team here since the user will be a team admin and their session won't reflect that yet
+	prevSchemeGuestValue := member.SchemeGuest
 
-	auditRec.Success()
-	auditRec.AddEventResultState(&team)
-	auditRec.AddEventObjectType("team")
+	var newExplicitRoles []string
+	member.SchemeGuest = false
+	member.SchemeUser = false
+	member.SchemeAdmin = false
 
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(rteam); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	team, err := c.App.GetTeam(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if (!team.AllowOpenInvite || team.Type != model.TeamOpen) && !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), team.Id, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	c.App.SanitizeTeam(*c.AppContext.Session(), team)
-	if err := json.NewEncoder(w).Encode(team); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getTeamByName(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamName()
-	if c.Err != nil {
-		return
-	}
-
-	team, err := c.App.GetTeamByName(c.Params.TeamName)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if (!team.AllowOpenInvite || team.Type != model.TeamOpen) && !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), team.Id, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	c.App.SanitizeTeam(*c.AppContext.Session(), team)
-	if err := json.NewEncoder(w).Encode(team); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func updateTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	var team model.Team
-	if jsonErr := json.NewDecoder(r.Body).Decode(&team); jsonErr != nil {
-		c.SetInvalidParamWithErr("team", jsonErr)
-		return
-	}
-
-	team.Email = strings.ToLower(team.Email)
-
-	// The team being updated in the payload must be the same one as indicated in the URL.
-	if team.Id != c.Params.TeamId {
-		c.SetInvalidParam("id")
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("updateTeam", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team", team)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	updatedTeam, err := c.App.UpdateTeam(&team)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	auditRec.AddEventResultState(updatedTeam)
-	auditRec.AddEventObjectType("team")
-
-	c.App.SanitizeTeam(*c.AppContext.Session(), updatedTeam)
-	if err := json.NewEncoder(w).Encode(updatedTeam); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func patchTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	var team model.TeamPatch
-	if jsonErr := json.NewDecoder(r.Body).Decode(&team); jsonErr != nil {
-		c.SetInvalidParamWithErr("team", jsonErr)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("patchTeam", audit.Fail)
-	auditRec.AddEventParameter("team_patch", team)
-	defer c.LogAuditRec(auditRec)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	if oldTeam, err := c.App.GetTeam(c.Params.TeamId); err == nil {
-		auditRec.AddEventPriorState(oldTeam)
-		auditRec.AddEventObjectType("team")
-	}
-
-	patchedTeam, err := c.App.PatchTeam(c.Params.TeamId, &team)
-
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	c.App.SanitizeTeam(*c.AppContext.Session(), patchedTeam)
-
-	auditRec.Success()
-	auditRec.AddEventResultState(patchedTeam)
-	c.LogAudit("")
-
-	if err := json.NewEncoder(w).Encode(patchedTeam); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func restoreTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("restoreTeam", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-	// On a cloud license, we must check limits before allowing to restore
-	if c.App.Channels().License().IsCloud() {
-		limits, err := c.App.Cloud().GetCloudLimits(c.AppContext.Session().UserId)
+	for _, roleName := range strings.Fields(newRoles) {
+		var role *model.Role
+		role, err = a.GetRoleByName(context.Background(), roleName)
 		if err != nil {
-			c.Err = model.NewAppError("Api4.restoreTeam", "api.cloud.app_error", nil, err.Error(), http.StatusInternalServerError)
-			return
+			err.StatusCode = http.StatusBadRequest
+			return nil, err
 		}
-
-		// If there are no limits for teams, for active teams, or the limit for active teams is less than 0, do nothing
-		if !(limits == nil || limits.Teams == nil || limits.Teams.Active == nil || *limits.Teams.Active <= 0) {
-			teamsUsage, appErr := c.App.GetTeamsUsage()
-			if appErr != nil {
-				c.Err = appErr
-				return
-			}
-			// if the number of active teams is greater than or equal to the limit, return 400
-			if teamsUsage.Active >= int64(*limits.Teams.Active) {
-				c.Err = model.NewAppError("Api4.restoreTeam", "api.cloud.teams_limit_reached.restore", nil, "", http.StatusBadRequest)
-				return
-			}
-		}
-	}
-
-	err := c.App.RestoreTeam(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	// Return the restored team to be consistent with RestoreChannel.
-	team, err := c.App.GetTeam(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.AddEventResultState(team)
-	auditRec.AddEventObjectType("team")
-	auditRec.Success()
-
-	if err := json.NewEncoder(w).Encode(team); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func updateTeamPrivacy(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	props := model.StringInterfaceFromJSON(r.Body)
-	privacy, ok := props["privacy"].(string)
-	if !ok {
-		c.SetInvalidParam("privacy")
-		return
-	}
-
-	var openInvite bool
-	switch privacy {
-	case model.TeamOpen:
-		openInvite = true
-	case model.TeamInvite:
-		openInvite = false
-	default:
-		c.SetInvalidParam("privacy")
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("updateTeamPrivacy", audit.Fail)
-	auditRec.AddEventParameter("props", props)
-	defer c.LogAuditRec(auditRec)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		auditRec.AddEventParameter("team_id", c.Params.TeamId)
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	if err := c.App.UpdateTeamPrivacy(c.Params.TeamId, privacy, openInvite); err != nil {
-		c.Err = err
-		return
-	}
-
-	// Return the updated team to be consistent with UpdateChannelPrivacy
-	team, err := c.App.GetTeam(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.AddEventResultState(team)
-	auditRec.AddEventObjectType("team")
-	auditRec.Success()
-
-	if err := json.NewEncoder(w).Encode(team); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func regenerateTeamInviteId(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("regenerateTeamInviteId", audit.Fail)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-	defer c.LogAuditRec(auditRec)
-
-	patchedTeam, err := c.App.RegenerateTeamInviteId(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	c.App.SanitizeTeam(*c.AppContext.Session(), patchedTeam)
-
-	if !*c.App.Config().PrivacySettings.ShowEmailAddress && !c.IsSystemAdmin() {
-		patchedTeam.Email = ""
-	}
-
-	auditRec.Success()
-	auditRec.AddEventResultState(patchedTeam)
-	auditRec.AddEventObjectType("team")
-	c.LogAudit("")
-
-	if err := json.NewEncoder(w).Encode(patchedTeam); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func deleteTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("deleteTeam", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	if team, err := c.App.GetTeam(c.Params.TeamId); err == nil {
-		auditRec.AddEventParameter("team", team)
-	}
-
-	var err *model.AppError
-	if c.Params.Permanent {
-		if *c.App.Config().ServiceSettings.EnableAPITeamDeletion {
-			err = c.App.PermanentDeleteTeamId(c.AppContext, c.Params.TeamId)
+		if !role.SchemeManaged {
+			// The role is not scheme-managed, so it's OK to apply it to the explicit roles field.
+			newExplicitRoles = append(newExplicitRoles, roleName)
 		} else {
-			err = model.NewAppError("deleteTeam", "api.user.delete_team.not_enabled.app_error", nil, "teamId="+c.Params.TeamId, http.StatusUnauthorized)
-		}
-	} else {
-		err = c.App.SoftDeleteTeam(c.Params.TeamId)
-	}
-
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	ReturnStatusOK(w)
-}
-
-func softDeleteTeamsExcept(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	err := c.App.SoftDeleteAllTeamsExcept(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-	}
-
-	ReturnStatusOK(w)
-}
-
-func getTeamsForUser(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireUserId()
-	if c.Err != nil {
-		return
-	}
-
-	if c.AppContext.Session().UserId != c.Params.UserId && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementUsers) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementUsers)
-		return
-	}
-
-	teams, appErr := c.App.GetTeamsForUser(c.Params.UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	c.App.SanitizeTeams(*c.AppContext.Session(), teams)
-
-	if !*c.App.Config().PrivacySettings.ShowEmailAddress && !c.IsSystemAdmin() {
-		for _, team := range teams {
-			team.Email = ""
+			// The role is scheme-managed, so need to check if it is part of the scheme for this channel or not.
+			switch roleName {
+			case schemeAdminRole:
+				member.SchemeAdmin = true
+			case schemeUserRole:
+				member.SchemeUser = true
+			case schemeGuestRole:
+				member.SchemeGuest = true
+			default:
+				// If not part of the scheme for this team, then it is not allowed to apply it as an explicit role.
+				return nil, model.NewAppError("UpdateTeamMemberRoles", "api.channel.update_team_member_roles.scheme_role.app_error", nil, "role_name="+roleName, http.StatusBadRequest)
+			}
 		}
 	}
 
-	js, err := json.Marshal(teams)
-	if err != nil {
-		c.Err = model.NewAppError("getTeamsForUser", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+	if member.SchemeGuest && member.SchemeUser {
+		return nil, model.NewAppError("UpdateTeamMemberRoles", "api.team.update_team_member_roles.guest_and_user.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	w.Write(js)
-}
-
-func getTeamsUnreadForUser(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireUserId()
-	if c.Err != nil {
-		return
+	if prevSchemeGuestValue != member.SchemeGuest {
+		return nil, model.NewAppError("UpdateTeamMemberRoles", "api.channel.update_team_member_roles.changing_guest_role.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	if c.AppContext.Session().UserId != c.Params.UserId && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionManageSystem) {
-		c.SetPermissionError(model.PermissionManageSystem)
-		return
-	}
+	member.ExplicitRoles = strings.Join(newExplicitRoles, " ")
 
-	// optional team id to be excluded from the result
-	teamId := r.URL.Query().Get("exclude_team")
-	includeCollapsedThreads := r.URL.Query().Get("include_collapsed_threads") == "true"
-
-	unreadTeamsList, appErr := c.App.GetTeamsUnreadForUser(teamId, c.Params.UserId, includeCollapsedThreads)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(unreadTeamsList)
-	if err != nil {
-		c.Err = model.NewAppError("getTeamsUnreadForUser", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-	w.Write(js)
-}
-
-func getTeamMember(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId().RequireUserId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	canSee, appErr := c.App.UserCanSeeOtherUser(c.AppContext.Session().UserId, c.Params.UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if !canSee {
-		c.SetPermissionError(model.PermissionViewMembers)
-		return
-	}
-
-	team, appErr := c.App.GetTeamMember(c.Params.TeamId, c.Params.UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(team); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getTeamMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	sort := r.URL.Query().Get("sort")
-	excludeDeletedUsers := r.URL.Query().Get("exclude_deleted_users")
-	excludeDeletedUsersBool, _ := strconv.ParseBool(excludeDeletedUsers)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	restrictions, appErr := c.App.GetViewUsersRestrictions(c.AppContext.Session().UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	teamMembersGetOptions := &model.TeamMembersGetOptions{
-		Sort:                sort,
-		ExcludeDeletedUsers: excludeDeletedUsersBool,
-		ViewRestrictions:    restrictions,
-	}
-
-	members, appErr := c.App.GetTeamMembers(c.Params.TeamId, c.Params.Page*c.Params.PerPage, c.Params.PerPage, teamMembersGetOptions)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(members)
-	if err != nil {
-		c.Err = model.NewAppError("getTeamMembers", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
-}
-
-func getTeamMembersForUser(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireUserId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToUser(*c.AppContext.Session(), c.Params.UserId) && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionReadOtherUsersTeams) {
-		c.SetPermissionError(model.PermissionReadOtherUsersTeams)
-		return
-	}
-
-	canSee, appErr := c.App.UserCanSeeOtherUser(c.AppContext.Session().UserId, c.Params.UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if !canSee {
-		c.SetPermissionError(model.PermissionViewMembers)
-		return
-	}
-
-	members, appErr := c.App.GetTeamMembersForUser(c.Params.UserId, "", true)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(members)
-	if err != nil {
-		c.Err = model.NewAppError("getTeamMembersForUser", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
-}
-
-func getTeamMembersByIds(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	var userIDs []string
-	err := json.NewDecoder(r.Body).Decode(&userIDs)
-	if err != nil || len(userIDs) == 0 {
-		c.SetInvalidParamWithErr("user_ids", err)
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	restrictions, appErr := c.App.GetViewUsersRestrictions(c.AppContext.Session().UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	members, appErr := c.App.GetTeamMembersByIds(c.Params.TeamId, userIDs, restrictions)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(members)
-	if err != nil {
-		c.Err = model.NewAppError("getTeamMembersByIds", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
-}
-
-func addTeamMember(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	var err *model.AppError
-	var member model.TeamMember
-	if jsonErr := json.NewDecoder(r.Body).Decode(&member); jsonErr != nil {
-		c.Err = model.NewAppError("addTeamMember", "api.team.add_team_member.invalid_body.app_error", nil, "Error in model.TeamMemberFromJSON()", http.StatusBadRequest).Wrap(jsonErr)
-		return
-	}
-	if member.TeamId != c.Params.TeamId {
-		c.SetInvalidParam("team_id")
-		return
-	}
-
-	if !model.IsValidId(member.UserId) {
-		c.SetInvalidParam("user_id")
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("addTeamMember", audit.Fail)
-	auditRec.AddEventParameter("member", member)
-	defer c.LogAuditRec(auditRec)
-
-	if member.UserId == c.AppContext.Session().UserId {
-		var team *model.Team
-		team, err = c.App.GetTeam(member.TeamId)
-		if err != nil {
-			c.Err = err
-			return
-		}
-
-		if team.AllowOpenInvite && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionJoinPublicTeams) {
-			c.SetPermissionError(model.PermissionJoinPublicTeams)
-			return
-		}
-		if !team.AllowOpenInvite && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionJoinPrivateTeams) {
-			c.SetPermissionError(model.PermissionJoinPrivateTeams)
-			return
-		}
-	} else {
-		if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), member.TeamId, model.PermissionAddUserToTeam) {
-			c.SetPermissionError(model.PermissionAddUserToTeam)
-			return
+	member, nErr = a.Srv().Store().Team().UpdateMember(member)
+	if nErr != nil {
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("UpdateTeamMemberRoles", "app.team.save_member.save.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
 		}
 	}
 
-	team, err := c.App.GetTeam(member.TeamId)
-	if err != nil {
-		c.Err = err
-		return
+	a.ClearSessionCacheForUser(userID)
+
+	if appErr := a.sendUpdatedMemberRoleEvent(userID, member); appErr != nil {
+		return nil, appErr
 	}
-	auditRec.AddMeta("team", team)
+
+	return member, nil
+}
+
+func (a *App) UpdateTeamMemberSchemeRoles(teamID string, userID string, isSchemeGuest bool, isSchemeUser bool, isSchemeAdmin bool) (*model.TeamMember, *model.AppError) {
+	member, err := a.GetTeamMember(teamID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	member.SchemeAdmin = isSchemeAdmin
+	member.SchemeUser = isSchemeUser
+	member.SchemeGuest = isSchemeGuest
+
+	if member.SchemeUser && member.SchemeGuest {
+		return nil, model.NewAppError("UpdateTeamMemberSchemeRoles", "api.team.update_team_member_roles.guest_and_user.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	// If the migration is not completed, we also need to check the default team_admin/team_user roles are not present in the roles field.
+	if err = a.IsPhase2MigrationCompleted(); err != nil {
+		member.ExplicitRoles = RemoveRoles([]string{model.TeamGuestRoleId, model.TeamUserRoleId, model.TeamAdminRoleId}, member.ExplicitRoles)
+	}
+
+	member, nErr := a.Srv().Store().Team().UpdateMember(member)
+	if nErr != nil {
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("UpdateTeamMemberSchemeRoles", "app.team.save_member.save.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	a.ClearSessionCacheForUser(userID)
+
+	if appErr := a.sendUpdatedMemberRoleEvent(userID, member); appErr != nil {
+		return nil, appErr
+	}
+
+	return member, nil
+}
+
+func (a *App) sendUpdatedMemberRoleEvent(userID string, member *model.TeamMember) *model.AppError {
+	message := model.NewWebSocketEvent(model.WebsocketEventMemberroleUpdated, "", "", userID, nil, "")
+	tmJSON, jsonErr := json.Marshal(member)
+	if jsonErr != nil {
+		return model.NewAppError("sendUpdatedMemberRoleEvent", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(jsonErr)
+	}
+	message.Add("member", string(tmJSON))
+	a.Publish(message)
+	return nil
+}
+
+func (a *App) AddUserToTeam(c request.CTX, teamID string, userID string, userRequestorId string) (*model.Team, *model.TeamMember, *model.AppError) {
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().Get(teamID)
+		tchan <- store.StoreResult{Data: team, NErr: err}
+		close(tchan)
+	}()
+
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), userID)
+		uchan <- store.StoreResult{Data: user, NErr: err}
+		close(uchan)
+	}()
+
+	result := <-tchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, model.NewAppError("AddUserToTeam", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, model.NewAppError("AddUserToTeam", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	team := result.Data.(*model.Team)
+
+	result = <-uchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, model.NewAppError("AddUserToTeam", MissingAccountError, nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, model.NewAppError("AddUserToTeam", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	user := result.Data.(*model.User)
+
+	teamMember, err := a.JoinUserToTeam(c, team, user, userRequestorId)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return team, teamMember, nil
+}
+
+func (a *App) AddUserToTeamByTeamId(c *request.Context, teamID string, user *model.User) *model.AppError {
+	team, err := a.Srv().Store().Team().Get(teamID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return model.NewAppError("AddUserToTeamByTeamId", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return model.NewAppError("AddUserToTeamByTeamId", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	if _, err := a.JoinUserToTeam(c, team, user, ""); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (a *App) AddUserToTeamByToken(c *request.Context, userID string, tokenID string) (*model.Team, *model.TeamMember, *model.AppError) {
+	token, err := a.Srv().Store().Token().GetByToken(tokenID)
+	if err != nil {
+		return nil, nil, model.NewAppError("AddUserToTeamByToken", "api.user.create_user.signup_link_invalid.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	if token.Type != TokenTypeTeamInvitation && token.Type != TokenTypeGuestInvitation {
+		return nil, nil, model.NewAppError("AddUserToTeamByToken", "api.user.create_user.signup_link_invalid.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	if model.GetMillis()-token.CreateAt >= InvitationExpiryTime {
+		a.DeleteToken(token)
+		return nil, nil, model.NewAppError("AddUserToTeamByToken", "api.user.create_user.signup_link_expired.app_error", nil, "", http.StatusBadRequest)
+	}
+
+	tokenData := model.MapFromJSON(strings.NewReader(token.Extra))
+
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().Get(tokenData["teamId"])
+		tchan <- store.StoreResult{Data: team, NErr: err}
+		close(tchan)
+	}()
+
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), userID)
+		uchan <- store.StoreResult{Data: user, NErr: err}
+		close(uchan)
+	}()
+
+	result := <-tchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, model.NewAppError("AddUserToTeamByToken", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, model.NewAppError("AddUserToTeamByToken", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	team := result.Data.(*model.Team)
 
 	if team.IsGroupConstrained() {
-		nonMembers, err := c.App.FilterNonGroupTeamMembers([]string{member.UserId}, team)
-		if err != nil {
-			if v, ok := err.(*model.AppError); ok {
-				c.Err = v
-			} else {
-				c.Err = model.NewAppError("addTeamMember", "api.team.add_members.error", nil, err.Error(), http.StatusBadRequest)
-			}
-			return
+		return nil, nil, model.NewAppError("AddUserToTeamByToken", "app.team.invite_token.group_constrained.error", nil, "", http.StatusForbidden)
+	}
+
+	result = <-uchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, model.NewAppError("AddUserToTeamByToken", MissingAccountError, nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, model.NewAppError("AddUserToTeamByToken", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
 		}
-		if len(nonMembers) > 0 {
-			c.Err = model.NewAppError("addTeamMember", "api.team.add_members.user_denied", map[string]any{"UserIDs": nonMembers}, "", http.StatusBadRequest)
-			return
-		}
+	}
+	user := result.Data.(*model.User)
+
+	if user.IsGuest() && token.Type == TokenTypeTeamInvitation {
+		return nil, nil, model.NewAppError("AddUserToTeamByToken", "api.user.create_user.invalid_invitation_type.app_error", nil, "", http.StatusBadRequest)
+	}
+	if !user.IsGuest() && token.Type == TokenTypeGuestInvitation {
+		return nil, nil, model.NewAppError("AddUserToTeamByToken", "api.user.create_user.invalid_invitation_type.app_error", nil, "", http.StatusBadRequest)
 	}
 
-	var tm *model.TeamMember
-	tm, err = c.App.AddTeamMember(c.AppContext, member.TeamId, member.UserId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.AddEventResultState(tm)
-	auditRec.AddEventObjectType("team_member") // TODO verify this is the final state. should it be the team instead?
-	auditRec.Success()
-
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(tm); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func addUserToTeamFromInvite(c *Context, w http.ResponseWriter, r *http.Request) {
-	tokenId := r.URL.Query().Get("token")
-	inviteId := r.URL.Query().Get("invite_id")
-
-	var member *model.TeamMember
-	var err *model.AppError
-
-	auditRec := c.MakeAuditRecord("addUserToTeamFromInvite", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("invite_id", inviteId)
-
-	if tokenId != "" {
-		member, err = c.App.AddTeamMemberByToken(c.AppContext, c.AppContext.Session().UserId, tokenId)
-	} else if inviteId != "" {
-		if c.AppContext.Session().Props[model.SessionPropIsGuest] == "true" {
-			c.Err = model.NewAppError("addUserToTeamFromInvite", "api.team.add_user_to_team_from_invite.guest.app_error", nil, "", http.StatusForbidden)
-			return
-		}
-
-		member, err = c.App.AddTeamMemberByInviteId(c.AppContext, inviteId, c.AppContext.Session().UserId)
-	} else {
-		err = model.NewAppError("addTeamMember", "api.team.add_user_to_team.missing_parameter.app_error", nil, "", http.StatusBadRequest)
-	}
-
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	if member != nil {
-		auditRec.AddMeta("member", member)
-	}
-
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(member); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func addTeamMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	graceful := r.URL.Query().Get("graceful") != ""
-
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	var appErr *model.AppError
-	var members []*model.TeamMember
-	if jsonErr := json.NewDecoder(r.Body).Decode(&members); jsonErr != nil {
-		c.SetInvalidParamWithErr("members", jsonErr)
-		return
-	}
-
-	if len(members) > MaxAddMembersBatch {
-		c.SetInvalidParam("too many members in batch")
-		return
-	}
-
-	if len(members) == 0 {
-		c.SetInvalidParam("no members in batch")
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("addTeamMembers", audit.Fail)
-	auditRec.AddEventParameter("members", members)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddMeta("count", len(members))
-
-	var memberIDs []string
-	for _, member := range members {
-		memberIDs = append(memberIDs, member.UserId)
-	}
-	auditRec.AddMeta("user_ids", memberIDs)
-
-	team, appErr := c.App.GetTeam(c.Params.TeamId)
+	teamMember, appErr := a.JoinUserToTeam(c, team, user, "")
 	if appErr != nil {
-		c.Err = appErr
-		return
+		return nil, nil, appErr
 	}
-	auditRec.AddMeta("team", team)
+
+	if token.Type == TokenTypeGuestInvitation {
+		channels, err := a.Srv().Store().Channel().GetChannelsByIds(strings.Split(tokenData["channels"], " "), false)
+		if err != nil {
+			return nil, nil, model.NewAppError("AddUserToTeamByToken", "app.channel.get_channels_by_ids.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		for _, channel := range channels {
+			_, err := a.AddUserToChannel(c, user, channel, false)
+			if err != nil {
+				mlog.Warn("Error adding user to channel", mlog.Err(err))
+			}
+		}
+	}
+
+	if err := a.DeleteToken(token); err != nil {
+		mlog.Warn("Error while deleting token", mlog.Err(err))
+	}
+
+	return team, teamMember, nil
+}
+
+func (a *App) AddUserToTeamByInviteId(c *request.Context, inviteId string, userID string) (*model.Team, *model.TeamMember, *model.AppError) {
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().GetByInviteId(inviteId)
+		tchan <- store.StoreResult{Data: team, NErr: err}
+		close(tchan)
+	}()
+
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), userID)
+		uchan <- store.StoreResult{Data: user, NErr: err}
+		close(uchan)
+	}()
+
+	result := <-tchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, model.NewAppError("AddUserToTeamByInviteId", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, model.NewAppError("AddUserToTeamByInviteId", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	team := result.Data.(*model.Team)
+
+	result = <-uchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, model.NewAppError("AddUserToTeamByInviteId", MissingAccountError, nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, model.NewAppError("AddUserToTeamByInviteId", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	user := result.Data.(*model.User)
+
+	teamMember, err := a.JoinUserToTeam(c, team, user, "")
+	if err != nil {
+		return nil, nil, err
+	}
+
+	return team, teamMember, nil
+}
+
+func (a *App) JoinUserToTeam(c request.CTX, team *model.Team, user *model.User, userRequestorId string) (*model.TeamMember, *model.AppError) {
+	teamMember, alreadyAdded, err := a.ch.srv.teamService.JoinUserToTeam(team, user)
+	if err != nil {
+		var appErr *model.AppError
+		var conflictErr *store.ErrConflict
+		var limitExceededErr *store.ErrLimitExceeded
+		switch {
+		case errors.Is(err, teams.AcceptedDomainError):
+			return nil, model.NewAppError("JoinUserToTeam", "api.team.join_user_to_team.allowed_domains.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.Is(err, teams.MemberCountError):
+			return nil, model.NewAppError("JoinUserToTeam", "app.team.get_active_member_count.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		case errors.Is(err, teams.MaxMemberCountError):
+			return nil, model.NewAppError("JoinUserToTeam", "app.team.join_user_to_team.max_accounts.app_error", nil, "teamId="+team.Id, http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr): // in case we haven't converted to plain error.
+			return nil, appErr
+		case errors.As(err, &conflictErr):
+			return nil, model.NewAppError("JoinUserToTeam", "app.team.join_user_to_team.save_member.conflict.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &limitExceededErr):
+			return nil, model.NewAppError("JoinUserToTeam", "app.team.join_user_to_team.save_member.max_accounts.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default: // last fallback in case it doesn't map to an existing app error.
+			return nil, model.NewAppError("JoinUserToTeam", "app.team.join_user_to_team.save_member.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+	if alreadyAdded {
+		return teamMember, nil
+	}
+
+	if _, err := a.Srv().Store().User().UpdateUpdateAt(user.Id); err != nil {
+		return nil, model.NewAppError("JoinUserToTeam", "app.user.update_update.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	opts := &store.SidebarCategorySearchOpts{
+		TeamID:      team.Id,
+		ExcludeTeam: false,
+	}
+	if _, err := a.createInitialSidebarCategories(user.Id, opts); err != nil {
+		mlog.Warn(
+			"Encountered an issue creating default sidebar categories.",
+			mlog.String("user_id", user.Id),
+			mlog.String("team_id", team.Id),
+			mlog.Err(err),
+		)
+	}
+
+	shouldBeAdmin := team.Email == user.Email
+
+	if !user.IsGuest() {
+		// Soft error if there is an issue joining the default channels
+		if err := a.JoinDefaultChannels(c, team.Id, user, shouldBeAdmin, userRequestorId); err != nil {
+			mlog.Warn(
+				"Encountered an issue joining default channels.",
+				mlog.String("user_id", user.Id),
+				mlog.String("team_id", team.Id),
+				mlog.Err(err),
+			)
+		}
+	}
+
+	a.ClearSessionCacheForUser(user.Id)
+	a.InvalidateCacheForUser(user.Id)
+	a.invalidateCacheForUserTeams(user.Id)
+
+	if pluginsEnvironment := a.GetPluginsEnvironment(); pluginsEnvironment != nil {
+		var actor *model.User
+		if userRequestorId != "" {
+			actor, _ = a.GetUser(userRequestorId)
+		}
+
+		a.Srv().Go(func() {
+			pluginContext := pluginContext(c)
+			pluginsEnvironment.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+				hooks.UserHasJoinedTeam(pluginContext, teamMember, actor)
+				return true
+			}, plugin.UserHasJoinedTeamID)
+		})
+	}
+
+	message := model.NewWebSocketEvent(model.WebsocketEventAddedToTeam, "", "", user.Id, nil, "")
+	message.Add("team_id", team.Id)
+	message.Add("user_id", user.Id)
+	a.Publish(message)
+
+	return teamMember, nil
+}
+
+func (a *App) GetTeam(teamID string) (*model.Team, *model.AppError) {
+	team, err := a.ch.srv.teamService.GetTeam(teamID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetTeam", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetTeam", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return team, nil
+}
+
+func (a *App) GetTeams(teamIDs []string) ([]*model.Team, *model.AppError) {
+	teams, err := a.ch.srv.teamService.GetTeams(teamIDs)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetTeam", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetTeam", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return teams, nil
+}
+
+func (a *App) GetTeamByName(name string) (*model.Team, *model.AppError) {
+	team, err := a.Srv().Store().Team().GetByName(name)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetTeamByName", "app.team.get_by_name.missing.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetTeamByName", "app.team.get_by_name.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		}
+	}
+
+	return team, nil
+}
+
+func (a *App) GetTeamByInviteId(inviteId string) (*model.Team, *model.AppError) {
+	team, err := a.Srv().Store().Team().GetByInviteId(inviteId)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetTeamByInviteId", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetTeamByInviteId", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return team, nil
+}
+
+func (a *App) GetAllTeams() ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().GetAll()
+	if err != nil {
+		return nil, model.NewAppError("GetAllTeams", "app.team.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+func (a *App) GetAllTeamsPage(offset int, limit int, opts *model.TeamSearch) ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().GetAllPage(offset, limit, opts)
+	if err != nil {
+		return nil, model.NewAppError("GetAllTeamsPage", "app.team.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+func (a *App) GetAllTeamsPageWithCount(offset int, limit int, opts *model.TeamSearch) (*model.TeamsWithCount, *model.AppError) {
+	totalCount, err := a.Srv().Store().Team().AnalyticsTeamCount(opts)
+	if err != nil {
+		return nil, model.NewAppError("GetAllTeamsPageWithCount", "app.team.analytics_team_count.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	teams, err := a.Srv().Store().Team().GetAllPage(offset, limit, opts)
+	if err != nil {
+		return nil, model.NewAppError("GetAllTeamsPageWithCount", "app.team.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return &model.TeamsWithCount{Teams: teams, TotalCount: totalCount}, nil
+}
+
+func (a *App) GetAllPrivateTeams() ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().GetAllPrivateTeamListing()
+	if err != nil {
+		return nil, model.NewAppError("GetAllPrivateTeams", "app.team.get_all_private_team_listing.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+func (a *App) GetAllPublicTeams() ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().GetAllTeamListing()
+	if err != nil {
+		return nil, model.NewAppError("GetAllPublicTeams", "app.team.get_all_team_listing.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+// SearchAllTeams returns a team list and the total count of the results
+func (a *App) SearchAllTeams(searchOpts *model.TeamSearch) ([]*model.Team, int64, *model.AppError) {
+	if searchOpts.IsPaginated() {
+		teams, count, err := a.Srv().Store().Team().SearchAllPaged(searchOpts)
+		if err != nil {
+			return nil, 0, model.NewAppError("SearchAllTeams", "app.team.search_all_team.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		return teams, count, nil
+	}
+	results, err := a.Srv().Store().Team().SearchAll(searchOpts)
+	if err != nil {
+		return nil, 0, model.NewAppError("SearchAllTeams", "app.team.search_all_team.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return results, int64(len(results)), nil
+}
+
+func (a *App) SearchPublicTeams(searchOpts *model.TeamSearch) ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().SearchOpen(searchOpts)
+	if err != nil {
+		return nil, model.NewAppError("SearchPublicTeams", "app.team.search_open_team.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+func (a *App) SearchPrivateTeams(searchOpts *model.TeamSearch) ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().SearchPrivate(searchOpts)
+	if err != nil {
+		return nil, model.NewAppError("SearchPrivateTeams", "app.team.search_private_team.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+func (a *App) GetTeamsForUser(userID string) ([]*model.Team, *model.AppError) {
+	teams, err := a.Srv().Store().Team().GetTeamsByUserId(userID)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamsForUser", "app.team.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teams, nil
+}
+
+func (a *App) GetTeamMember(teamID, userID string) (*model.TeamMember, *model.AppError) {
+	teamMember, err := a.Srv().Store().Team().GetMember(sqlstore.WithMaster(context.Background()), teamID, userID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetTeamMember", "app.team.get_member.missing.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetTeamMember", "app.team.get_member.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return teamMember, nil
+}
+
+func (a *App) GetTeamMembersForUser(userID string, excludeTeamID string, includeDeleted bool) ([]*model.TeamMember, *model.AppError) {
+	teamMembers, err := a.Srv().Store().Team().GetTeamsForUser(context.Background(), userID, excludeTeamID, includeDeleted)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamMembersForUser", "app.team.get_members.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teamMembers, nil
+}
+
+func (a *App) GetTeamMembersForUserWithPagination(userID string, page, perPage int) ([]*model.TeamMember, *model.AppError) {
+	teamMembers, err := a.Srv().Store().Team().GetTeamsForUserWithPagination(userID, page, perPage)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamMembersForUserWithPagination", "app.team.get_members.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teamMembers, nil
+}
+
+func (a *App) GetTeamMembers(teamID string, offset int, limit int, teamMembersGetOptions *model.TeamMembersGetOptions) ([]*model.TeamMember, *model.AppError) {
+	teamMembers, err := a.Srv().Store().Team().GetMembers(teamID, offset, limit, teamMembersGetOptions)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamMembers", "app.team.get_members.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teamMembers, nil
+}
+
+func (a *App) GetTeamMembersByIds(teamID string, userIDs []string, restrictions *model.ViewUsersRestrictions) ([]*model.TeamMember, *model.AppError) {
+	teamMembers, err := a.Srv().Store().Team().GetMembersByIds(teamID, userIDs, restrictions)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamMembersByIds", "app.team.get_members_by_ids.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teamMembers, nil
+}
+
+func (a *App) GetCommonTeamIDsForTwoUsers(userID, otherUserID string) ([]string, *model.AppError) {
+	teamIDs, err := a.Srv().Store().Team().GetCommonTeamIDsForTwoUsers(userID, otherUserID)
+	if err != nil {
+		return nil, model.NewAppError("GetCommonTeamIDsForUsers", "app.team.get_common_team_ids_for_users.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return teamIDs, nil
+}
+
+func (a *App) AddTeamMember(c request.CTX, teamID, userID string) (*model.TeamMember, *model.AppError) {
+	_, teamMember, err := a.AddUserToTeam(c, teamID, userID, "")
+	if err != nil {
+		return nil, err
+	}
+
+	message := model.NewWebSocketEvent(model.WebsocketEventAddedToTeam, "", "", userID, nil, "")
+	message.Add("team_id", teamID)
+	message.Add("user_id", userID)
+	a.Publish(message)
+
+	return teamMember, nil
+}
+
+func (a *App) AddTeamMembers(c *request.Context, teamID string, userIDs []string, userRequestorId string, graceful bool) ([]*model.TeamMemberWithError, *model.AppError) {
+	var membersWithErrors []*model.TeamMemberWithError
+
+	for _, userID := range userIDs {
+		_, teamMember, err := a.AddUserToTeam(c, teamID, userID, userRequestorId)
+		if err != nil {
+			if graceful {
+				membersWithErrors = append(membersWithErrors, &model.TeamMemberWithError{
+					UserId: userID,
+					Error:  err,
+				})
+				continue
+			}
+			return nil, err
+		}
+
+		membersWithErrors = append(membersWithErrors, &model.TeamMemberWithError{
+			UserId: userID,
+			Member: teamMember,
+		})
+
+		message := model.NewWebSocketEvent(model.WebsocketEventAddedToTeam, "", "", userID, nil, "")
+		message.Add("team_id", teamID)
+		message.Add("user_id", userID)
+		a.Publish(message)
+	}
+
+	return membersWithErrors, nil
+}
+
+func (a *App) AddTeamMemberByToken(c *request.Context, userID, tokenID string) (*model.TeamMember, *model.AppError) {
+	_, teamMember, err := a.AddUserToTeamByToken(c, userID, tokenID)
+	if err != nil {
+		return nil, err
+	}
+
+	return teamMember, nil
+}
+
+func (a *App) AddTeamMemberByInviteId(c *request.Context, inviteId, userID string) (*model.TeamMember, *model.AppError) {
+	team, teamMember, err := a.AddUserToTeamByInviteId(c, inviteId, userID)
+	if err != nil {
+		return nil, err
+	}
 
 	if team.IsGroupConstrained() {
-		nonMembers, err := c.App.FilterNonGroupTeamMembers(memberIDs, team)
-		if err != nil {
-			if v, ok := err.(*model.AppError); ok {
-				c.Err = v
-			} else {
-				c.Err = model.NewAppError("addTeamMembers", "api.team.add_members.error", nil, "", http.StatusBadRequest).Wrap(err)
+		return nil, model.NewAppError("AddTeamMemberByInviteId", "app.team.invite_id.group_constrained.error", nil, "", http.StatusForbidden)
+	}
+
+	return teamMember, nil
+}
+
+func (a *App) GetTeamUnread(teamID, userID string) (*model.TeamUnread, *model.AppError) {
+	channelUnreads, err := a.Srv().Store().Team().GetChannelUnreadsForTeam(teamID, userID)
+
+	if err != nil {
+		return nil, model.NewAppError("GetTeamUnread", "app.team.get_unread.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	var teamUnread = &model.TeamUnread{
+		MsgCount:         0,
+		MentionCount:     0,
+		MentionCountRoot: 0,
+		MsgCountRoot:     0,
+		TeamId:           teamID,
+	}
+	for _, cu := range channelUnreads {
+		teamUnread.MentionCount += cu.MentionCount
+		teamUnread.MentionCountRoot += cu.MentionCountRoot
+
+		if cu.NotifyProps[model.MarkUnreadNotifyProp] != model.ChannelMarkUnreadMention {
+			teamUnread.MsgCount += cu.MsgCount
+			teamUnread.MsgCountRoot += cu.MsgCountRoot
+		}
+	}
+
+	return teamUnread, nil
+}
+
+func (a *App) RemoveUserFromTeam(c request.CTX, teamID string, userID string, requestorId string) *model.AppError {
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().Get(teamID)
+		tchan <- store.StoreResult{Data: team, NErr: err}
+		close(tchan)
+	}()
+
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), userID)
+		uchan <- store.StoreResult{Data: user, NErr: err}
+		close(uchan)
+	}()
+
+	result := <-tchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return model.NewAppError("RemoveUserFromTeam", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return model.NewAppError("RemoveUserFromTeam", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	team := result.Data.(*model.Team)
+
+	result = <-uchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return model.NewAppError("RemoveUserFromTeam", MissingAccountError, nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return model.NewAppError("RemoveUserFromTeam", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	user := result.Data.(*model.User)
+
+	if err := a.LeaveTeam(c, team, user, requestorId); err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (a *App) postProcessTeamMemberLeave(c request.CTX, teamMember *model.TeamMember, requestorId string) *model.AppError {
+	if pluginsEnvironment := a.GetPluginsEnvironment(); pluginsEnvironment != nil {
+		var actor *model.User
+		if requestorId != "" {
+			actor, _ = a.GetUser(requestorId)
+		}
+
+		a.Srv().Go(func() {
+			pluginContext := pluginContext(c)
+			pluginsEnvironment.RunMultiPluginHook(func(hooks plugin.Hooks) bool {
+				hooks.UserHasLeftTeam(pluginContext, teamMember, actor)
+				return true
+			}, plugin.UserHasLeftTeamID)
+		})
+	}
+
+	user, nErr := a.Srv().Store().User().Get(context.Background(), teamMember.UserId)
+	if nErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(nErr, &nfErr):
+			return model.NewAppError("postProcessTeamMemberLeave", MissingAccountError, nil, "", http.StatusNotFound).Wrap(nErr)
+		default:
+			return model.NewAppError("postProcessTeamMemberLeave", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	if _, err := a.Srv().Store().User().UpdateUpdateAt(user.Id); err != nil {
+		return model.NewAppError("postProcessTeamMemberLeave", "app.user.update_update.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	if err := a.Srv().Store().Channel().ClearSidebarOnTeamLeave(user.Id, teamMember.TeamId); err != nil {
+		return model.NewAppError("postProcessTeamMemberLeave", "app.channel.sidebar_categories.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	// delete the preferences that set the last channel used in the team and other team specific preferences
+	if err := a.Srv().Store().Preference().DeleteCategory(user.Id, teamMember.TeamId); err != nil {
+		return model.NewAppError("postProcessTeamMemberLeave", "app.preference.delete.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	a.ClearSessionCacheForUser(user.Id)
+	a.InvalidateCacheForUser(user.Id)
+	a.invalidateCacheForUserTeams(user.Id)
+
+	return nil
+}
+
+func (a *App) LeaveTeam(c request.CTX, team *model.Team, user *model.User, requestorId string) *model.AppError {
+	teamMember, err := a.GetTeamMember(team.Id, user.Id)
+	if err != nil {
+		return model.NewAppError("LeaveTeam", "api.team.remove_user_from_team.missing.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	var channelList model.ChannelList
+	var nErr error
+	if channelList, nErr = a.Srv().Store().Channel().GetChannels(team.Id, user.Id, &model.ChannelSearchOpts{
+		IncludeDeleted: true,
+		LastDeleteAt:   0,
+	}); nErr != nil {
+		var nfErr *store.ErrNotFound
+		if errors.As(nErr, &nfErr) {
+			channelList = model.ChannelList{}
+		} else {
+			return model.NewAppError("LeaveTeam", "app.channel.get_channels.get.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	for _, channel := range channelList {
+		if !channel.IsGroupOrDirect() {
+			a.invalidateCacheForChannelMembers(channel.Id)
+			if nErr = a.Srv().Store().Channel().RemoveMember(channel.Id, user.Id); nErr != nil {
+				return model.NewAppError("LeaveTeam", "app.channel.remove_member.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
 			}
-			return
-		}
-		if len(nonMembers) > 0 {
-			c.Err = model.NewAppError("addTeamMembers", "api.team.add_members.user_denied", map[string]any{"UserIDs": nonMembers}, "", http.StatusBadRequest)
-			return
 		}
 	}
 
-	var userIDs []string
-	for _, member := range members {
-		if member.TeamId != c.Params.TeamId {
-			c.SetInvalidParam("team_id for member with user_id=" + member.UserId)
-			return
-		}
-
-		if !model.IsValidId(member.UserId) {
-			c.SetInvalidParam("user_id")
-			return
-		}
-
-		userIDs = append(userIDs, member.UserId)
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionAddUserToTeam) {
-		c.SetPermissionError(model.PermissionAddUserToTeam)
-		return
-	}
-
-	membersWithErrors, appErr := c.App.AddTeamMembers(c.AppContext, c.Params.TeamId, userIDs, c.AppContext.Session().UserId, graceful)
-
-	if len(membersWithErrors) != 0 {
-		errList := make([]string, 0, len(membersWithErrors))
-		for _, m := range membersWithErrors {
-			if m.Error != nil {
-				errList = append(errList, model.TeamMemberWithErrorToString(m))
+	if *a.Config().ServiceSettings.ExperimentalEnableDefaultChannelLeaveJoinMessages {
+		channel, cErr := a.Srv().Store().Channel().GetByName(team.Id, model.DefaultChannelName, false)
+		if cErr != nil {
+			var nfErr *store.ErrNotFound
+			switch {
+			case errors.As(cErr, &nfErr):
+				return model.NewAppError("LeaveTeam", "app.channel.get_by_name.missing.app_error", nil, "", http.StatusNotFound).Wrap(cErr)
+			default:
+				return model.NewAppError("LeaveTeam", "app.channel.get_by_name.existing.app_error", nil, "", http.StatusInternalServerError).Wrap(cErr)
 			}
 		}
-		auditRec.AddMeta("errors", errList)
-	}
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
 
-	var (
-		js  []byte
-		err error
-	)
-	if graceful {
-		// in 'graceful' mode we allow a different return value, notifying the client which users were not added
-		js, err = json.Marshal(membersWithErrors)
-	} else {
-		js, err = json.Marshal(model.TeamMembersWithErrorToTeamMembers(membersWithErrors))
-	}
-	if err != nil {
-		c.Err = model.NewAppError("addTeamMembers", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	auditRec.Success()
-
-	w.WriteHeader(http.StatusCreated)
-	w.Write(js)
-}
-
-func removeTeamMember(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId().RequireUserId()
-	if c.Err != nil {
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("removeTeamMember", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	if c.AppContext.Session().UserId != c.Params.UserId {
-		if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionRemoveUserFromTeam) {
-			c.SetPermissionError(model.PermissionRemoveUserFromTeam)
-			return
+		if requestorId == user.Id {
+			if err = a.postLeaveTeamMessage(c, user, channel); err != nil {
+				c.Logger().Warn("Failed to post join/leave message", mlog.Err(err))
+			}
+		} else {
+			if err = a.postRemoveFromTeamMessage(c, user, channel); err != nil {
+				c.Logger().Warn("Failed to post join/leave message", mlog.Err(err))
+			}
 		}
 	}
 
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-	auditRec.AddEventParameter("user_id", c.Params.UserId)
-
-	team, err := c.App.GetTeam(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddMeta("team", team)
-
-	user, err := c.App.GetUser(c.Params.UserId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddMeta("user", user)
-
-	if team.IsGroupConstrained() && (c.Params.UserId != c.AppContext.Session().UserId) && !user.IsBot {
-		c.Err = model.NewAppError("removeTeamMember", "api.team.remove_member.group_constrained.app_error", nil, "", http.StatusBadRequest)
-		return
+	if err := a.ch.srv.teamService.RemoveTeamMember(teamMember); err != nil {
+		return model.NewAppError("RemoveTeamMemberFromTeam", "app.team.save_member.save.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if err := c.App.RemoveUserFromTeam(c.AppContext, c.Params.TeamId, c.Params.UserId, c.AppContext.Session().UserId); err != nil {
-		c.Err = err
-		return
+	if err := a.postProcessTeamMemberLeave(c, teamMember, requestorId); err != nil {
+		return err
 	}
 
-	auditRec.Success()
-	ReturnStatusOK(w)
+	return nil
 }
 
-func getTeamUnread(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId().RequireUserId()
-	if c.Err != nil {
-		return
+func (a *App) postLeaveTeamMessage(c request.CTX, user *model.User, channel *model.Channel) *model.AppError {
+	post := &model.Post{
+		ChannelId: channel.Id,
+		Message:   fmt.Sprintf(i18n.T("api.team.leave.left"), user.Username),
+		Type:      model.PostTypeLeaveTeam,
+		UserId:    user.Id,
+		Props: model.StringInterface{
+			"username": user.Username,
+		},
 	}
 
-	if !c.App.SessionHasPermissionToUser(*c.AppContext.Session(), c.Params.UserId) {
-		c.SetPermissionError(model.PermissionEditOtherUsers)
-		return
+	if _, err := a.CreatePost(c, post, channel, false, true); err != nil {
+		return model.NewAppError("postRemoveFromChannelMessage", "api.channel.post_user_add_remove_message_and_forget.error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	unreadTeam, err := c.App.GetTeamUnread(c.Params.TeamId, c.Params.UserId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(unreadTeam); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return nil
 }
 
-func getTeamStats(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
+func (a *App) postRemoveFromTeamMessage(c request.CTX, user *model.User, channel *model.Channel) *model.AppError {
+	post := &model.Post{
+		ChannelId: channel.Id,
+		Message:   fmt.Sprintf(i18n.T("api.team.remove_user_from_team.removed"), user.Username),
+		Type:      model.PostTypeRemoveFromTeam,
+		UserId:    user.Id,
+		Props: model.StringInterface{
+			"username": user.Username,
+		},
 	}
 
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
+	if _, err := a.CreatePost(c, post, channel, false, true); err != nil {
+		return model.NewAppError("postRemoveFromTeamMessage", "api.channel.post_user_add_remove_message_and_forget.error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	restrictions, err := c.App.GetViewUsersRestrictions(c.AppContext.Session().UserId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	stats, err := c.App.GetTeamStats(c.Params.TeamId, restrictions)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(stats); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return nil
 }
 
-func updateTeamMemberRoles(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId().RequireUserId()
-	if c.Err != nil {
-		return
-	}
+func (a *App) prepareInviteNewUsersToTeam(teamID, senderId string, channelIds []string) (*model.User, *model.Team, []*model.Channel, *model.AppError) {
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().Get(teamID)
+		tchan <- store.StoreResult{Data: team, NErr: err}
+		close(tchan)
+	}()
 
-	props := model.MapFromJSON(r.Body)
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), senderId)
+		uchan <- store.StoreResult{Data: user, NErr: err}
+		close(uchan)
+	}()
 
-	newRoles := props["roles"]
-	if !model.IsValidUserRoles(newRoles) {
-		c.SetInvalidParam("team_member_roles")
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("updateTeamMemberRoles", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("props", props)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeamRoles) {
-		c.SetPermissionError(model.PermissionManageTeamRoles)
-		return
-	}
-
-	teamMember, err := c.App.UpdateTeamMemberRoles(c.Params.TeamId, c.Params.UserId, newRoles)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	auditRec.AddEventResultState(teamMember)
-	auditRec.AddEventObjectType("team_member")
-
-	ReturnStatusOK(w)
-}
-
-func updateTeamMemberSchemeRoles(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId().RequireUserId()
-	if c.Err != nil {
-		return
-	}
-
-	var schemeRoles model.SchemeRoles
-	if jsonErr := json.NewDecoder(r.Body).Decode(&schemeRoles); jsonErr != nil {
-		c.SetInvalidParamWithErr("scheme_roles", jsonErr)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("updateTeamMemberSchemeRoles", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("scheme_roles", schemeRoles)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeamRoles) {
-		c.SetPermissionError(model.PermissionManageTeamRoles)
-		return
-	}
-
-	teamMember, err := c.App.UpdateTeamMemberSchemeRoles(c.Params.TeamId, c.Params.UserId, schemeRoles.SchemeGuest, schemeRoles.SchemeUser, schemeRoles.SchemeAdmin)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	auditRec.AddEventResultState(teamMember)
-	auditRec.AddEventObjectType("team_member")
-
-	ReturnStatusOK(w)
-}
-
-func getAllTeams(c *Context, w http.ResponseWriter, r *http.Request) {
-	teams := []*model.Team{}
-	var appErr *model.AppError
-	var teamsWithCount *model.TeamsWithCount
-
-	opts := &model.TeamSearch{}
-	if c.Params.ExcludePolicyConstrained {
-		if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadComplianceDataRetentionPolicy) {
-			c.SetPermissionError(model.PermissionSysconsoleReadComplianceDataRetentionPolicy)
-			return
-		}
-		opts.ExcludePolicyConstrained = model.NewBool(true)
-	}
-	if c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadComplianceDataRetentionPolicy) {
-		opts.IncludePolicyID = model.NewBool(true)
-	}
-
-	listPrivate := c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPrivateTeams)
-	listPublic := c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPublicTeams)
-	limit := c.Params.PerPage
-	offset := limit * c.Params.Page
-	if listPrivate && listPublic {
-	} else if listPrivate {
-		opts.AllowOpenInvite = model.NewBool(false)
-	} else if listPublic {
-		opts.AllowOpenInvite = model.NewBool(true)
-	} else {
-		// The user doesn't have permissions to list private as well as public teams.
-		c.Err = model.NewAppError("getAllTeams", "api.team.get_all_teams.insufficient_permissions", nil, "", http.StatusForbidden)
-		return
-	}
-
-	if c.Params.IncludeTotalCount {
-		teamsWithCount, appErr = c.App.GetAllTeamsPageWithCount(offset, limit, opts)
-	} else {
-		teams, appErr = c.App.GetAllTeamsPage(offset, limit, opts)
-	}
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	var (
-		js  []byte
-		err error
-	)
-	if c.Params.IncludeTotalCount {
-		c.App.SanitizeTeams(*c.AppContext.Session(), teamsWithCount.Teams)
-		js, err = json.Marshal(teamsWithCount)
-	} else {
-		c.App.SanitizeTeams(*c.AppContext.Session(), teams)
-		js, err = json.Marshal(teams)
-	}
-	if err != nil {
-		c.Err = model.NewAppError("getAllTeams", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
-}
-
-func searchTeams(c *Context, w http.ResponseWriter, r *http.Request) {
-	var props model.TeamSearch
-	if err := json.NewDecoder(r.Body).Decode(&props); err != nil {
-		c.SetInvalidParamWithErr("team_search", err)
-		return
-	}
-	// Only system managers may use the ExcludePolicyConstrained field
-	if props.ExcludePolicyConstrained != nil && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadComplianceDataRetentionPolicy) {
-		c.SetPermissionError(model.PermissionSysconsoleReadComplianceDataRetentionPolicy)
-		return
-	}
-	// policy ID may only be used through the /data_retention/policies endpoint
-	props.PolicyID = nil
-	if c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadComplianceDataRetentionPolicy) {
-		props.IncludePolicyID = model.NewBool(true)
-	}
-
-	var (
-		teams      []*model.Team
-		totalCount int64
-		appErr     *model.AppError
-	)
-
-	if c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPrivateTeams) && c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPublicTeams) {
-		teams, totalCount, appErr = c.App.SearchAllTeams(&props)
-	} else if c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPrivateTeams) {
-		if props.Page != nil || props.PerPage != nil {
-			c.Err = model.NewAppError("searchTeams", "api.team.search_teams.pagination_not_implemented.private_team_search", nil, "", http.StatusNotImplemented)
-			return
-		}
-		teams, appErr = c.App.SearchPrivateTeams(&props)
-	} else if c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPublicTeams) {
-		if props.Page != nil || props.PerPage != nil {
-			c.Err = model.NewAppError("searchTeams", "api.team.search_teams.pagination_not_implemented.public_team_search", nil, "", http.StatusNotImplemented)
-			return
-		}
-		teams, appErr = c.App.SearchPublicTeams(&props)
-	} else {
-		teams = []*model.Team{}
-	}
-
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	c.App.SanitizeTeams(*c.AppContext.Session(), teams)
-
-	var payload []byte
-	if props.Page != nil && props.PerPage != nil {
-		twc := map[string]any{"teams": teams, "total_count": totalCount}
-		payload = model.ToJSON(twc)
-	} else {
-		js, err := json.Marshal(teams)
+	var channels []*model.Channel
+	var err error
+	if len(channelIds) > 0 {
+		channels, err = a.Srv().Store().Channel().GetChannelsByIds(channelIds, false)
 		if err != nil {
-			c.Err = model.NewAppError("searchTeams", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-			return
+			return nil, nil, nil, model.NewAppError("prepareInviteNewUsersToTeam", "app.channel.get_channels_by_ids.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
-		payload = js
+	}
+	result := <-tchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, nil, model.NewAppError("prepareInviteNewUsersToTeam", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, nil, model.NewAppError("prepareInviteNewUsersToTeam", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	team := result.Data.(*model.Team)
+
+	result = <-uchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, nil, model.NewAppError("prepareInviteNewUsersToTeam", MissingAccountError, nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, nil, model.NewAppError("prepareInviteNewUsersToTeam", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	user := result.Data.(*model.User)
+
+	for _, channel := range channels {
+		if channel.TeamId != teamID {
+			return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", "api.team.invite_guests.channel_in_invalid_team.app_error", nil, "", http.StatusBadRequest)
+		}
 	}
 
-	w.Write(payload)
+	return user, team, channels, nil
 }
 
-func teamExists(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamName()
-	if c.Err != nil {
-		return
-	}
-
-	team, err := c.App.GetTeamByName(c.Params.TeamName)
-	if err != nil && err.StatusCode != http.StatusNotFound {
-		c.Err = err
-		return
-	}
-
-	exists := false
-
-	if team != nil {
-		var teamMember *model.TeamMember
-		teamMember, err = c.App.GetTeamMember(team.Id, c.AppContext.Session().UserId)
-		if err != nil && err.StatusCode != http.StatusNotFound {
-			c.Err = err
-			return
-		}
-
-		// Verify that the user can see the team (be a member or have the permission to list the team)
-		if (teamMember != nil && teamMember.DeleteAt == 0) ||
-			(team.AllowOpenInvite && c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPublicTeams)) ||
-			(!team.AllowOpenInvite && c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionListPrivateTeams)) {
-			exists = true
-		}
-	}
-
-	resp := map[string]bool{"exists": exists}
-	w.Write([]byte(model.MapBoolToJSON(resp)))
-}
-
-func importTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	if c.App.Channels().License().IsCloud() {
-		c.Err = model.NewAppError("importTeam", "api.restricted_system_admin", nil, "", http.StatusForbidden)
-		return
-	}
-
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionImportTeam) {
-		c.SetPermissionError(model.PermissionImportTeam)
-		return
-	}
-
-	if err := r.ParseMultipartForm(MaximumBulkImportSize); err != nil {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.parse.app_error", nil, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	importFromArray, ok := r.MultipartForm.Value["importFrom"]
-	if !ok || len(importFromArray) < 1 {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.no_import_from.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-	importFrom := importFromArray[0]
-
-	fileSizeStr, ok := r.MultipartForm.Value["filesize"]
-	if !ok || len(fileSizeStr) < 1 {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.unavailable.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	fileSize, err := strconv.ParseInt(fileSizeStr[0], 10, 64)
-	if err != nil {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.integer.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	fileInfoArray, ok := r.MultipartForm.File["file"]
-	if !ok {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.no_file.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if len(fileInfoArray) <= 0 {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.array.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("importTeam", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-
-	fileInfo := fileInfoArray[0]
-
-	fileData, err := fileInfo.Open()
-	if err != nil {
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.open.app_error", nil, err.Error(), http.StatusBadRequest)
-		return
-	}
-	defer fileData.Close()
-	auditRec.AddEventParameter("filename", fileInfo.Filename)
-	auditRec.AddEventParameter("filesize", fileSize)
-	auditRec.AddEventParameter("from", importFrom)
-
-	var log *bytes.Buffer
-	data := map[string]string{}
-	switch importFrom {
-	case "slack":
-		var err *model.AppError
-		if err, log = c.App.SlackImport(c.AppContext, fileData, fileSize, c.Params.TeamId); err != nil {
-			c.Err = err
-			c.Err.StatusCode = http.StatusBadRequest
-		}
-		data["results"] = base64.StdEncoding.EncodeToString(log.Bytes())
-	default:
-		c.Err = model.NewAppError("importTeam", "api.team.import_team.unknown_import_from.app_error", nil, "", http.StatusBadRequest)
-	}
-
-	if c.Err != nil {
-		w.WriteHeader(c.Err.StatusCode)
-		return
-	}
-	auditRec.Success()
-	w.Write([]byte(model.MapToJSON(data)))
-}
-
-func inviteUsersToTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	graceful := r.URL.Query().Get("graceful") != ""
-
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionInviteUser) {
-		c.SetPermissionError(model.PermissionInviteUser)
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionAddUserToTeam) {
-		c.SetPermissionError(model.PermissionInviteUser)
-		return
-	}
-
-	bf, err := io.ReadAll(r.Body)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.inviteUsersToTeams", "api.team.invite_members_to_team_and_channels.invalid_body.app_error", nil, "", http.StatusBadRequest).Wrap(err)
-		return
-	}
-	memberInvite := &model.MemberInvite{}
-	if err := json.Unmarshal(bf, memberInvite); err != nil {
-		c.Err = model.NewAppError("Api4.inviteUsersToTeams", "api.team.invite_members_to_team_and_channels.invalid_body_parsing.app_error", nil, "", http.StatusBadRequest).Wrap(err)
-		return
+func (a *App) InviteNewUsersToTeamGracefully(memberInvite *model.MemberInvite, teamID, senderId string, reminderInterval string) ([]*model.EmailInviteWithError, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableEmailInvitations {
+		return nil, model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
 	emailList := memberInvite.Emails
 
 	if len(emailList) == 0 {
-		c.SetInvalidParam("user_email")
-		return
+		err := model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.no_one.app_error", nil, "", http.StatusBadRequest)
+		return nil, err
+	}
+	user, team, channels, err := a.prepareInviteNewUsersToTeam(teamID, senderId, memberInvite.ChannelIds)
+	if err != nil {
+		return nil, err
+	}
+	allowedDomains := a.ch.srv.teamService.GetAllowedDomains(user, team)
+	var inviteListWithErrors []*model.EmailInviteWithError
+	var goodEmails []string
+	for _, email := range emailList {
+		invite := &model.EmailInviteWithError{
+			Email: email,
+			Error: nil,
+		}
+		if !teams.IsEmailAddressAllowed(email, allowedDomains) {
+			invite.Error = model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.invalid_email.app_error", map[string]any{"Addresses": email}, "", http.StatusBadRequest)
+		} else {
+			goodEmails = append(goodEmails, email)
+		}
+		inviteListWithErrors = append(inviteListWithErrors, invite)
 	}
 
-	for i := range emailList {
-		emailList[i] = strings.ToLower(emailList[i])
+	var reminderData *model.TeamInviteReminderData
+	if reminderInterval != "" {
+		reminderData = &model.TeamInviteReminderData{Interval: reminderInterval}
 	}
 
-	auditRec := c.MakeAuditRecord("inviteUsersToTeam", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("member_invite", memberInvite)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-	auditRec.AddMeta("count", len(emailList))
-	auditRec.AddMeta("emails", emailList)
-
-	if len(memberInvite.ChannelIds) > 0 {
-		auditRec.AddMeta("channel_count", len(memberInvite.ChannelIds))
-		auditRec.AddMeta("channels", memberInvite.ChannelIds)
-	}
-
-	if graceful {
-		var invitesWithError []*model.EmailInviteWithError
-		var appErr *model.AppError
-		if emailList != nil {
-			invitesWithError, appErr = c.App.InviteNewUsersToTeamGracefully(memberInvite, c.Params.TeamId, c.AppContext.Session().UserId, "")
+	if len(goodEmails) > 0 {
+		nameFormat := *a.Config().TeamSettings.TeammateNameDisplay
+		senderProfileImage, _, err := a.GetProfileImage(user)
+		if err != nil {
+			a.Log().Warn("Unable to get the sender user profile image.", mlog.String("user_id", user.Id), mlog.String("team_id", team.Id), mlog.Err(err))
 		}
 
-		if invitesWithError != nil {
-			errList := make([]string, 0, len(invitesWithError))
-			for _, inv := range invitesWithError {
-				if inv.Error != nil {
-					errList = append(errList, model.EmailInviteWithErrorToString(inv))
+		userIsFirstAdmin := a.UserIsFirstAdmin(user)
+		var eErr error
+		var invitesWithErrors2 []*model.EmailInviteWithError
+		if len(channels) > 0 {
+			invitesWithErrors2, eErr = a.Srv().EmailService.SendInviteEmailsToTeamAndChannels(team, channels, user.GetDisplayName(nameFormat), user.Id, senderProfileImage, goodEmails, a.GetSiteURL(), reminderData, memberInvite.Message, true, user.IsSystemAdmin(), userIsFirstAdmin)
+			inviteListWithErrors = append(inviteListWithErrors, invitesWithErrors2...)
+		} else {
+			eErr = a.Srv().EmailService.SendInviteEmails(team, user.GetDisplayName(nameFormat), user.Id, goodEmails, a.GetSiteURL(), reminderData, true, user.IsSystemAdmin(), userIsFirstAdmin)
+		}
+		if eErr != nil {
+			switch {
+			case errors.Is(eErr, email.SendMailError):
+				for i := range inviteListWithErrors {
+					if inviteListWithErrors[i].Error == nil {
+						if *a.Config().EmailSettings.SMTPServer == model.EmailSMTPDefaultServer && *a.Config().EmailSettings.SMTPPort == model.EmailSMTPDefaultPort {
+							inviteListWithErrors[i].Error = model.NewAppError("InviteNewUsersToTeamGracefully", "api.team.invite_members.unable_to_send_email_with_defaults.app_error", nil, "", http.StatusInternalServerError)
+						} else {
+							inviteListWithErrors[i].Error = model.NewAppError("InviteNewUsersToTeamGracefully", "api.team.invite_members.unable_to_send_email.app_error", nil, "", http.StatusInternalServerError)
+						}
+					}
 				}
+			case errors.Is(eErr, email.NoRateLimiterError):
+				return nil, model.NewAppError("InviteNewUsersToTeamGracefully", "app.email.no_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s", user.Id, team.Id), http.StatusInternalServerError)
+			case errors.Is(eErr, email.SetupRateLimiterError):
+				return nil, model.NewAppError("InviteNewUsersToTeamGracefully", "app.email.setup_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, eErr), http.StatusInternalServerError)
+			default:
+				return nil, model.NewAppError("InviteNewUsersToTeamGracefully", "app.email.rate_limit_exceeded.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, eErr), http.StatusRequestEntityTooLarge)
 			}
-			auditRec.AddMeta("errors", errList)
 		}
-		if appErr != nil {
-			c.Err = appErr
-			return
-		}
-
-		// we get the emailList after it has finished checks like the emails over the list
-		scheduledAt := model.GetMillis()
-		jobData := map[string]string{
-			"emailList":   model.ArrayToJSON(emailList),
-			"teamID":      c.Params.TeamId,
-			"senderID":    c.AppContext.Session().UserId,
-			"scheduledAt": strconv.FormatInt(scheduledAt, 10),
-		}
-
-		if len(memberInvite.ChannelIds) > 0 {
-			jobData["channelList"] = model.ArrayToJSON(memberInvite.ChannelIds)
-		}
-
-		// we then manually schedule the job to send another invite after 48 hours
-		_, appErr = c.App.Srv().Jobs.CreateJob(model.JobTypeResendInvitationEmail, jobData)
-		if appErr != nil {
-			c.Err = model.NewAppError("Api4.inviteUsersToTeam", appErr.Id, nil, appErr.Error(), appErr.StatusCode)
-			return
-		}
-
-		// in graceful mode we return both the successful ones and the failed ones
-		js, err := json.Marshal(invitesWithError)
-		if err != nil {
-			c.Err = model.NewAppError("inviteUsersToTeam", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-			return
-		}
-
-		w.Write(js)
-	} else {
-		appErr := c.App.InviteNewUsersToTeam(emailList, c.Params.TeamId, c.AppContext.Session().UserId)
-		if appErr != nil {
-			c.Err = appErr
-			return
-		}
-		ReturnStatusOK(w)
 	}
-	auditRec.Success()
+
+	return inviteListWithErrors, nil
 }
 
-func inviteGuestsToChannels(c *Context, w http.ResponseWriter, r *http.Request) {
-	graceful := r.URL.Query().Get("graceful") != ""
-	if c.App.Channels().License() == nil {
-		c.Err = model.NewAppError("Api4.InviteGuestsToChannels", "api.team.invite_guests_to_channels.license.error", nil, "", http.StatusNotImplemented)
-		return
+func (a *App) prepareInviteGuestsToChannels(teamID string, guestsInvite *model.GuestsInvite, senderId string) (*model.User, *model.Team, []*model.Channel, *model.AppError) {
+	if err := guestsInvite.IsValid(); err != nil {
+		return nil, nil, nil, err
 	}
 
-	if !*c.App.Config().GuestAccountsSettings.Enable {
-		c.Err = model.NewAppError("Api4.InviteGuestsToChannels", "api.team.invite_guests_to_channels.disabled.error", nil, "", http.StatusNotImplemented)
-		return
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().Get(teamID)
+		tchan <- store.StoreResult{Data: team, NErr: err}
+		close(tchan)
+	}()
+	cchan := make(chan store.StoreResult, 1)
+	go func() {
+		channels, err := a.Srv().Store().Channel().GetChannelsByIds(guestsInvite.Channels, false)
+		cchan <- store.StoreResult{Data: channels, NErr: err}
+		close(cchan)
+	}()
+	uchan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), senderId)
+		uchan <- store.StoreResult{Data: user, NErr: err}
+		close(uchan)
+	}()
+
+	result := <-cchan
+	if result.NErr != nil {
+		return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", "app.channel.get_channels_by_ids.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+	}
+	channels := result.Data.([]*model.Channel)
+
+	result = <-uchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", MissingAccountError, nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	user := result.Data.(*model.User)
+
+	result = <-tchan
+	if result.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(result.NErr, &nfErr):
+			return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusNotFound).Wrap(result.NErr)
+		default:
+			return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", "app.team.get_by_invite_id.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
+		}
+	}
+	team := result.Data.(*model.Team)
+
+	for _, channel := range channels {
+		if channel.TeamId != teamID {
+			return nil, nil, nil, model.NewAppError("prepareInviteGuestsToChannels", "api.team.invite_guests.channel_in_invalid_team.app_error", nil, "", http.StatusBadRequest)
+		}
+	}
+	return user, team, channels, nil
+}
+
+func (a *App) InviteGuestsToChannelsGracefully(teamID string, guestsInvite *model.GuestsInvite, senderId string) ([]*model.EmailInviteWithError, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableEmailInvitations {
+		return nil, model.NewAppError("InviteGuestsToChannelsGracefully", "api.team.invite_members.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
+	user, team, channels, err := a.prepareInviteGuestsToChannels(teamID, guestsInvite, senderId)
+	if err != nil {
+		return nil, err
 	}
 
-	auditRec := c.MakeAuditRecord("inviteGuestsToChannels", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionInviteGuest) {
-		c.SetPermissionError(model.PermissionInviteGuest)
-		return
+	var inviteListWithErrors []*model.EmailInviteWithError
+	var goodEmails []string
+	for _, email := range guestsInvite.Emails {
+		invite := &model.EmailInviteWithError{
+			Email: email,
+			Error: nil,
+		}
+		if !users.CheckEmailDomain(email, *a.Config().GuestAccountsSettings.RestrictCreationToDomains) {
+			invite.Error = model.NewAppError("InviteGuestsToChannelsGracefully", "api.team.invite_members.invalid_email.app_error", map[string]any{"Addresses": email}, "", http.StatusBadRequest)
+		} else {
+			goodEmails = append(goodEmails, email)
+		}
+		inviteListWithErrors = append(inviteListWithErrors, invite)
 	}
 
-	guestEnabled := c.App.Channels().License() != nil && *c.App.Channels().License().Features.GuestAccounts
+	if len(goodEmails) > 0 {
+		nameFormat := *a.Config().TeamSettings.TeammateNameDisplay
+		senderProfileImage, _, err := a.GetProfileImage(user)
+		if err != nil {
+			a.Log().Warn("Unable to get the sender user profile image.", mlog.String("user_id", user.Id), mlog.String("team_id", team.Id), mlog.Err(err))
+		}
 
-	if !guestEnabled {
-		c.Err = model.NewAppError("Api4.InviteGuestsToChannels", "api.team.invite_guests_to_channels.disabled.error", nil, "", http.StatusForbidden)
-		return
+		eErr := a.Srv().EmailService.SendGuestInviteEmails(team, channels, user.GetDisplayName(nameFormat), user.Id, senderProfileImage, goodEmails, a.GetSiteURL(), guestsInvite.Message, true, user.IsSystemAdmin(), a.UserIsFirstAdmin(user))
+		if eErr != nil {
+			switch {
+			case errors.Is(eErr, email.SendMailError):
+				for i := range inviteListWithErrors {
+					if inviteListWithErrors[i].Error == nil {
+						if *a.Config().EmailSettings.SMTPServer == model.EmailSMTPDefaultServer && *a.Config().EmailSettings.SMTPPort == model.EmailSMTPDefaultPort {
+							inviteListWithErrors[i].Error = model.NewAppError("InviteGuestsToChannelsGracefully", "api.team.invite_members.unable_to_send_email_with_defaults.app_error", nil, "", http.StatusInternalServerError)
+						} else {
+							inviteListWithErrors[i].Error = model.NewAppError("InviteGuestsToChannelsGracefully", "api.team.invite_members.unable_to_send_email.app_error", nil, "", http.StatusInternalServerError)
+						}
+
+					}
+				}
+			case errors.Is(eErr, email.NoRateLimiterError):
+				return nil, model.NewAppError("SendInviteEmails", "app.email.no_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s", user.Id, team.Id), http.StatusInternalServerError)
+			case errors.Is(eErr, email.SetupRateLimiterError):
+				return nil, model.NewAppError("SendInviteEmails", "app.email.setup_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, eErr), http.StatusInternalServerError)
+			default:
+				return nil, model.NewAppError("SendInviteEmails", "app.email.rate_limit_exceeded.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, eErr), http.StatusRequestEntityTooLarge)
+			}
+		}
 	}
 
-	var guestsInvite model.GuestsInvite
-	if err := json.NewDecoder(r.Body).Decode(&guestsInvite); err != nil {
-		c.Err = model.NewAppError("Api4.inviteGuestsToChannels", "api.team.invite_guests_to_channels.invalid_body.app_error", nil, "", http.StatusBadRequest).Wrap(err)
-		return
-	}
-	auditRec.AddEventParameter("guests_invite", guestsInvite)
+	return inviteListWithErrors, nil
+}
 
-	for i, email := range guestsInvite.Emails {
-		guestsInvite.Emails[i] = strings.ToLower(email)
+func (a *App) InviteNewUsersToTeam(emailList []string, teamID, senderId string) *model.AppError {
+	if !*a.Config().ServiceSettings.EnableEmailInvitations {
+		return model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.disabled.app_error", nil, "", http.StatusNotImplemented)
 	}
-	if appErr := guestsInvite.IsValid(); appErr != nil {
-		c.Err = appErr
-		return
-	}
-	auditRec.AddMeta("email_count", len(guestsInvite.Emails))
-	auditRec.AddMeta("emails", guestsInvite.Emails)
-	auditRec.AddMeta("channel_count", len(guestsInvite.Channels))
-	auditRec.AddMeta("channels", guestsInvite.Channels)
 
-	if graceful {
-		var invitesWithError []*model.EmailInviteWithError
+	if len(emailList) == 0 {
+		err := model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.no_one.app_error", nil, "", http.StatusBadRequest)
+		return err
+	}
+
+	user, team, _, err := a.prepareInviteNewUsersToTeam(teamID, senderId, []string{})
+	if err != nil {
+		return err
+	}
+
+	allowedDomains := a.ch.srv.teamService.GetAllowedDomains(user, team)
+	var invalidEmailList []string
+
+	for _, email := range emailList {
+		if !teams.IsEmailAddressAllowed(email, allowedDomains) {
+			invalidEmailList = append(invalidEmailList, email)
+		}
+	}
+
+	if len(invalidEmailList) > 0 {
+		s := strings.Join(invalidEmailList, ", ")
+		return model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.invalid_email.app_error", map[string]any{"Addresses": s}, "", http.StatusBadRequest)
+	}
+
+	nameFormat := *a.Config().TeamSettings.TeammateNameDisplay
+	eErr := a.Srv().EmailService.SendInviteEmails(team, user.GetDisplayName(nameFormat), user.Id, emailList, a.GetSiteURL(), nil, false, user.IsSystemAdmin(), a.UserIsFirstAdmin(user))
+	if eErr != nil {
+		switch {
+		case errors.Is(eErr, email.NoRateLimiterError):
+			return model.NewAppError("SendInviteEmails", "app.email.no_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s", user.Id, team.Id), http.StatusInternalServerError)
+		case errors.Is(eErr, email.SetupRateLimiterError):
+			return model.NewAppError("SendInviteEmails", "app.email.setup_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, eErr), http.StatusInternalServerError)
+		default:
+			return model.NewAppError("SendInviteEmails", "app.email.rate_limit_exceeded.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, eErr), http.StatusRequestEntityTooLarge)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) InviteGuestsToChannels(teamID string, guestsInvite *model.GuestsInvite, senderId string) *model.AppError {
+	if !*a.Config().ServiceSettings.EnableEmailInvitations {
+		return model.NewAppError("InviteNewUsersToTeam", "api.team.invite_members.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	user, team, channels, err := a.prepareInviteGuestsToChannels(teamID, guestsInvite, senderId)
+	if err != nil {
+		return err
+	}
+
+	var invalidEmailList []string
+	for _, email := range guestsInvite.Emails {
+		if !users.CheckEmailDomain(email, *a.Config().GuestAccountsSettings.RestrictCreationToDomains) {
+			invalidEmailList = append(invalidEmailList, email)
+		}
+	}
+
+	if len(invalidEmailList) > 0 {
+		s := strings.Join(invalidEmailList, ", ")
+		return model.NewAppError("InviteGuestsToChannels", "api.team.invite_members.invalid_email.app_error", map[string]any{"Addresses": s}, "", http.StatusBadRequest)
+	}
+
+	nameFormat := *a.Config().TeamSettings.TeammateNameDisplay
+	senderProfileImage, _, err := a.GetProfileImage(user)
+	if err != nil {
+		a.Log().Warn("Unable to get the sender user profile image.", mlog.String("user_id", user.Id), mlog.String("team_id", team.Id), mlog.Err(err))
+	}
+
+	eErr := a.Srv().EmailService.SendGuestInviteEmails(team, channels, user.GetDisplayName(nameFormat), user.Id, senderProfileImage, guestsInvite.Emails, a.GetSiteURL(), guestsInvite.Message, false, user.IsSystemAdmin(), a.UserIsFirstAdmin(user))
+	if eErr != nil {
+		switch {
+		case errors.Is(eErr, email.NoRateLimiterError):
+			return model.NewAppError("SendInviteEmails", "app.email.no_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s", user.Id, team.Id), http.StatusInternalServerError)
+		case errors.Is(eErr, email.SetupRateLimiterError):
+			return model.NewAppError("SendInviteEmails", "app.email.setup_rate_limiter.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, err), http.StatusInternalServerError)
+		default:
+			return model.NewAppError("SendInviteEmails", "app.email.rate_limit_exceeded.app_error", nil, fmt.Sprintf("user_id=%s, team_id=%s, error=%v", user.Id, team.Id, err), http.StatusRequestEntityTooLarge)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) FindTeamByName(name string) bool {
+	if _, err := a.Srv().Store().Team().GetByName(name); err != nil {
+		return false
+	}
+	return true
+}
+
+func (a *App) GetTeamsUnreadForUser(excludeTeamId string, userID string, includeCollapsedThreads bool) ([]*model.TeamUnread, *model.AppError) {
+	data, err := a.Srv().Store().Team().GetChannelUnreadsForAllTeams(excludeTeamId, userID)
+	if err != nil {
+		return nil, model.NewAppError("GetTeamsUnreadForUser", "app.team.get_unread.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	members := []*model.TeamUnread{}
+	membersMap := make(map[string]*model.TeamUnread)
+
+	unreads := func(cu *model.ChannelUnread, tu *model.TeamUnread) *model.TeamUnread {
+		tu.MentionCount += cu.MentionCount
+		tu.MentionCountRoot += cu.MentionCountRoot
+
+		if cu.NotifyProps[model.MarkUnreadNotifyProp] != model.ChannelMarkUnreadMention {
+			tu.MsgCount += cu.MsgCount
+			tu.MsgCountRoot += cu.MsgCountRoot
+		}
+
+		return tu
+	}
+
+	teamIDs := make([]string, 0, len(data))
+	for i := range data {
+		id := data[i].TeamId
+		if mu, ok := membersMap[id]; ok {
+			membersMap[id] = unreads(data[i], mu)
+		} else {
+			teamIDs = append(teamIDs, id)
+			membersMap[id] = unreads(data[i], &model.TeamUnread{
+				MsgCount:                 0,
+				MentionCount:             0,
+				MentionCountRoot:         0,
+				MsgCountRoot:             0,
+				ThreadCount:              0,
+				ThreadMentionCount:       0,
+				ThreadUrgentMentionCount: 0,
+				TeamId:                   id,
+			})
+		}
+	}
+
+	includeCollapsedThreads = includeCollapsedThreads && *a.Config().ServiceSettings.CollapsedThreads != model.CollapsedThreadsDisabled
+
+	if includeCollapsedThreads {
+		teamUnreads, err := a.Srv().Store().Thread().GetTeamsUnreadForUser(userID, teamIDs, a.isPostPriorityEnabled())
+		if err != nil {
+			return nil, model.NewAppError("GetTeamsUnreadForUser", "app.team.get_unread.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		for teamID, member := range membersMap {
+			if _, ok := teamUnreads[teamID]; ok {
+				member.ThreadCount = teamUnreads[teamID].ThreadCount
+				member.ThreadMentionCount = teamUnreads[teamID].ThreadMentionCount
+				member.ThreadUrgentMentionCount = teamUnreads[teamID].ThreadUrgentMentionCount
+			}
+		}
+	}
+
+	for _, member := range membersMap {
+		members = append(members, member)
+	}
+	return members, nil
+}
+
+func (a *App) PermanentDeleteTeamId(c request.CTX, teamID string) *model.AppError {
+	team, err := a.GetTeam(teamID)
+	if err != nil {
+		return err
+	}
+
+	return a.PermanentDeleteTeam(c, team)
+}
+
+func (a *App) PermanentDeleteTeam(c request.CTX, team *model.Team) *model.AppError {
+	team.DeleteAt = model.GetMillis()
+	if _, err := a.Srv().Store().Team().Update(team); err != nil {
+		var invErr *store.ErrInvalidInput
 		var appErr *model.AppError
-
-		if guestsInvite.Emails != nil {
-			invitesWithError, appErr = c.App.InviteGuestsToChannelsGracefully(c.Params.TeamId, &guestsInvite, c.AppContext.Session().UserId)
+		switch {
+		case errors.As(err, &invErr):
+			return model.NewAppError("PermanentDeleteTeam", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr):
+			return appErr
+		default:
+			return model.NewAppError("PermanentDeleteTeam", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
+	}
 
-		if appErr != nil {
-			errList := make([]string, 0, len(invitesWithError))
-			for _, inv := range invitesWithError {
-				errList = append(errList, model.EmailInviteWithErrorToString(inv))
-			}
-			auditRec.AddMeta("errors", errList)
-			c.Err = appErr
-			return
+	if channels, err := a.Srv().Store().Channel().GetTeamChannels(team.Id); err != nil {
+		var nfErr *store.ErrNotFound
+		if !errors.As(err, &nfErr) {
+			return model.NewAppError("PermanentDeleteTeam", "app.channel.get_channels.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
-		// in graceful mode we return both the successful ones and the failed ones
-		js, err := json.Marshal(invitesWithError)
-		if err != nil {
-			c.Err = model.NewAppError("inviteGuestsToChannel", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-			return
-		}
-
-		w.Write(js)
 	} else {
-		appErr := c.App.InviteGuestsToChannels(c.Params.TeamId, &guestsInvite, c.AppContext.Session().UserId)
-		if appErr != nil {
-			c.Err = appErr
-			return
+		for _, ch := range channels {
+			a.PermanentDeleteChannel(c, ch)
 		}
-		ReturnStatusOK(w)
 	}
-	auditRec.Success()
+
+	if err := a.Srv().Store().Team().RemoveAllMembersByTeam(team.Id); err != nil {
+		return model.NewAppError("PermanentDeleteTeam", "app.team.remove_member.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	if err := a.Srv().Store().Command().PermanentDeleteByTeam(team.Id); err != nil {
+		return model.NewAppError("PermanentDeleteTeam", "app.team.permanentdeleteteam.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	if err := a.Srv().Store().Team().PermanentDelete(team.Id); err != nil {
+		return model.NewAppError("PermanentDeleteTeam", "app.team.permanent_delete.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	if appErr := a.sendTeamEvent(team, model.WebsocketEventDeleteTeam); appErr != nil {
+		return appErr
+	}
+
+	return nil
 }
 
-func getInviteInfo(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireInviteId()
-	if c.Err != nil {
-		return
-	}
-
-	team, appErr := c.App.GetTeamByInviteId(c.Params.InviteId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if team.Type != model.TeamOpen {
-		c.Err = model.NewAppError("getInviteInfo", "api.team.get_invite_info.not_open_team", nil, "id="+c.Params.InviteId, http.StatusForbidden)
-		return
-	}
-
-	result := struct {
-		DisplayName string `json:"display_name"`
-		Description string `json:"description"`
-		Name        string `json:"name"`
-		ID          string `json:"id"`
-	}{
-		DisplayName: team.DisplayName,
-		Description: team.Description,
-		Name:        team.Name,
-		ID:          team.Id,
-	}
-
-	err := json.NewEncoder(w).Encode(result)
+func (a *App) SoftDeleteTeam(teamID string) *model.AppError {
+	team, err := a.GetTeam(teamID)
 	if err != nil {
-		c.Logger.Warn("Error writing response", mlog.Err(err))
+		return err
 	}
+
+	team.DeleteAt = model.GetMillis()
+	team, nErr := a.Srv().Store().Team().Update(team)
+	if nErr != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &invErr):
+			return model.NewAppError("SoftDeleteTeam", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(nErr)
+		case errors.As(nErr, &appErr):
+			return appErr
+		default:
+			return model.NewAppError("SoftDeleteTeam", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	if appErr := a.sendTeamEvent(team, model.WebsocketEventDeleteTeam); appErr != nil {
+		return appErr
+	}
+
+	return nil
 }
 
-func invalidateAllEmailInvites(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionInvalidateEmailInvite) {
-		c.SetPermissionError(model.PermissionInvalidateEmailInvite)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("invalidateAllEmailInvites", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	if err := c.App.InvalidateAllEmailInvites(); err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	ReturnStatusOK(w)
-}
-
-func getTeamIcon(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	team, err := c.App.GetTeam(c.Params.TeamId)
-
+func (a *App) RestoreTeam(teamID string) *model.AppError {
+	team, err := a.GetTeam(teamID)
 	if err != nil {
-		c.Err = err
-		return
+		return err
 	}
 
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) &&
-		(team.Type != model.TeamOpen || !team.AllowOpenInvite) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
+	team.DeleteAt = 0
+	team, nErr := a.Srv().Store().Team().Update(team)
+	if nErr != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &invErr):
+			return model.NewAppError("RestoreTeam", "app.team.update.find.app_error", nil, "", http.StatusBadRequest).Wrap(nErr)
+		case errors.As(nErr, &appErr):
+			return appErr
+		default:
+			return model.NewAppError("RestoreTeam", "app.team.update.updating.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
 	}
 
-	etag := strconv.FormatInt(team.LastTeamIconUpdate, 10)
-
-	if c.HandleEtag(etag, "Get Team Icon", w, r) {
-		return
+	if appErr := a.sendTeamEvent(team, model.WebsocketEventRestoreTeam); appErr != nil {
+		return appErr
 	}
 
-	img, err := c.App.GetTeamIcon(team)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	w.Header().Set("Content-Type", "image/png")
-	w.Header().Set("Cache-Control", fmt.Sprintf("max-age=%v, private", model.DayInSeconds)) // 24 hrs
-	w.Header().Set(model.HeaderEtagServer, etag)
-	w.Write(img)
+	return nil
 }
 
-func setTeamIcon(c *Context, w http.ResponseWriter, r *http.Request) {
-	defer io.Copy(io.Discard, r.Body)
+func (a *App) GetTeamStats(teamID string, restrictions *model.ViewUsersRestrictions) (*model.TeamStats, *model.AppError) {
+	tchan := make(chan store.StoreResult, 1)
+	go func() {
+		totalMemberCount, err := a.Srv().Store().Team().GetTotalMemberCount(teamID, restrictions)
+		tchan <- store.StoreResult{Data: totalMemberCount, NErr: err}
+		close(tchan)
+	}()
+	achan := make(chan store.StoreResult, 1)
+	go func() {
+		memberCount, err := a.Srv().Store().Team().GetActiveMemberCount(teamID, restrictions)
+		achan <- store.StoreResult{Data: memberCount, NErr: err}
+		close(achan)
+	}()
 
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
+	stats := &model.TeamStats{}
+	stats.TeamId = teamID
+
+	result := <-tchan
+	if result.NErr != nil {
+		return nil, model.NewAppError("GetTeamStats", "app.team.get_member_count.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
 	}
+	stats.TotalMemberCount = result.Data.(int64)
 
-	auditRec := c.MakeAuditRecord("setTeamIcon", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
+	result = <-achan
+	if result.NErr != nil {
+		return nil, model.NewAppError("GetTeamStats", "app.team.get_active_member_count.app_error", nil, "", http.StatusInternalServerError).Wrap(result.NErr)
 	}
+	stats.ActiveMemberCount = result.Data.(int64)
 
-	if r.ContentLength > *c.App.Config().FileSettings.MaxFileSize {
-		c.Err = model.NewAppError("setTeamIcon", "api.team.set_team_icon.too_large.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if err := r.ParseMultipartForm(*c.App.Config().FileSettings.MaxFileSize); err != nil {
-		c.Err = model.NewAppError("setTeamIcon", "api.team.set_team_icon.parse.app_error", nil, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	m := r.MultipartForm
-
-	imageArray, ok := m.File["image"]
-	if !ok {
-		c.Err = model.NewAppError("setTeamIcon", "api.team.set_team_icon.no_file.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if len(imageArray) <= 0 {
-		c.Err = model.NewAppError("setTeamIcon", "api.team.set_team_icon.array.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	imageData := imageArray[0]
-
-	if err := c.App.SetTeamIcon(c.Params.TeamId, imageData); err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	c.LogAudit("")
-
-	ReturnStatusOK(w)
+	return stats, nil
 }
 
-func removeTeamIcon(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
+func (a *App) GetTeamIdFromQuery(query url.Values) (string, *model.AppError) {
+	tokenID := query.Get("t")
+	inviteId := query.Get("id")
 
-	auditRec := c.MakeAuditRecord("removeTeamIcon", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("team_id", c.Params.TeamId)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionManageTeam) {
-		c.SetPermissionError(model.PermissionManageTeam)
-		return
-	}
-
-	if err := c.App.RemoveTeamIcon(c.Params.TeamId); err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	c.LogAudit("")
-
-	ReturnStatusOK(w)
-}
-
-func updateTeamScheme(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	var p model.SchemeIDPatch
-	if jsonErr := json.NewDecoder(r.Body).Decode(&p); jsonErr != nil {
-		c.SetInvalidParamWithErr("scheme_id", jsonErr)
-		return
-	}
-
-	schemeID := p.SchemeID
-	if p.SchemeID == nil || (!model.IsValidId(*p.SchemeID) && *p.SchemeID != "") {
-		c.SetInvalidParam("scheme_id")
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("updateTeamScheme", audit.Fail)
-	auditRec.AddEventParameter("scheme_id_patch", p)
-	defer c.LogAuditRec(auditRec)
-
-	if c.App.Channels().License() == nil {
-		c.Err = model.NewAppError("Api4.UpdateTeamScheme", "api.team.update_team_scheme.license.error", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleWriteUserManagementPermissions) {
-		c.SetPermissionError(model.PermissionSysconsoleWriteUserManagementPermissions)
-		return
-	}
-
-	if *schemeID != "" {
-		scheme, err := c.App.GetScheme(*schemeID)
+	if tokenID != "" {
+		token, err := a.Srv().Store().Token().GetByToken(tokenID)
 		if err != nil {
-			c.Err = err
-			return
+			return "", model.NewAppError("GetTeamIdFromQuery", "api.oauth.singup_with_oauth.invalid_link.app_error", nil, "", http.StatusBadRequest)
 		}
-		auditRec.AddMeta("scheme", scheme)
 
-		if scheme.Scope != model.SchemeScopeTeam {
-			c.Err = model.NewAppError("Api4.UpdateTeamScheme", "api.team.update_team_scheme.scheme_scope.error", nil, "", http.StatusBadRequest)
-			return
+		if token.Type != TokenTypeTeamInvitation && token.Type != TokenTypeGuestInvitation {
+			return "", model.NewAppError("GetTeamIdFromQuery", "api.oauth.singup_with_oauth.invalid_link.app_error", nil, "", http.StatusBadRequest)
 		}
+
+		if model.GetMillis()-token.CreateAt >= InvitationExpiryTime {
+			a.DeleteToken(token)
+			return "", model.NewAppError("GetTeamIdFromQuery", "api.oauth.singup_with_oauth.expired_link.app_error", nil, "", http.StatusBadRequest)
+		}
+
+		tokenData := model.MapFromJSON(strings.NewReader(token.Extra))
+
+		return tokenData["teamId"], nil
+	}
+	if inviteId != "" {
+		team, err := a.Srv().Store().Team().GetByInviteId(inviteId)
+		if err == nil {
+			return team.Id, nil
+		}
+		// soft fail, so we still create user but don't auto-join team
+		mlog.Warn("Error getting team by inviteId.", mlog.String("invite_id", inviteId), mlog.Err(err))
 	}
 
-	team, err := c.App.GetTeam(c.Params.TeamId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddMeta("team", team)
-
-	team.SchemeId = schemeID
-
-	team, err = c.App.UpdateTeamScheme(team)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.AddEventResultState(team)
-	auditRec.AddEventObjectType("team")
-	auditRec.Success()
-	ReturnStatusOK(w)
+	return "", nil
 }
 
-func teamMembersMinusGroupMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
+func (a *App) SanitizeTeam(session model.Session, team *model.Team) *model.Team {
+	if a.SessionHasPermissionToTeam(session, team.Id, model.PermissionManageTeam) {
+		return team
 	}
 
-	groupIDsParam := groupIDsQueryParamRegex.ReplaceAllString(c.Params.GroupIDs, "")
-
-	if len(groupIDsParam) < 26 {
-		c.SetInvalidParam("group_ids")
-		return
+	if a.SessionHasPermissionToTeam(session, team.Id, model.PermissionInviteUser) {
+		inviteId := team.InviteId
+		team.Sanitize()
+		team.InviteId = inviteId
+		return team
 	}
 
-	groupIDs := []string{}
-	for _, gid := range strings.Split(c.Params.GroupIDs, ",") {
-		if !model.IsValidId(gid) {
-			c.SetInvalidParam("group_ids")
-			return
-		}
-		groupIDs = append(groupIDs, gid)
+	team.Sanitize()
+
+	return team
+}
+
+func (a *App) SanitizeTeams(session model.Session, teams []*model.Team) []*model.Team {
+	for _, team := range teams {
+		a.SanitizeTeam(session, team)
 	}
 
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementGroups) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementGroups)
-		return
+	return teams
+}
+
+func (a *App) GetTeamIcon(team *model.Team) ([]byte, *model.AppError) {
+	if *a.Config().FileSettings.DriverName == "" {
+		return nil, model.NewAppError("GetTeamIcon", "api.team.get_team_icon.filesettings_no_driver.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	users, totalCount, appErr := c.App.TeamMembersMinusGroupMembers(
-		c.Params.TeamId,
-		groupIDs,
-		c.Params.Page,
-		c.Params.PerPage,
-	)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(&model.UsersWithGroupsAndCount{
-		Users: users,
-		Count: totalCount,
-	})
+	path := "teams/" + team.Id + "/teamIcon.png"
+	data, err := a.ReadFile(path)
 	if err != nil {
-		c.Err = model.NewAppError("Api4.teamMembersMinusGroupMembers", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return nil, model.NewAppError("GetTeamIcon", "api.team.get_team_icon.read_file.app_error", nil, "", http.StatusNotFound).Wrap(err)
 	}
 
-	w.Write(b)
+	return data, nil
+}
+
+func (a *App) SetTeamIcon(teamID string, imageData *multipart.FileHeader) *model.AppError {
+	file, err := imageData.Open()
+	if err != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.set_team_icon.open.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+	defer file.Close()
+	return a.SetTeamIconFromMultiPartFile(teamID, file)
+}
+
+func (a *App) SetTeamIconFromMultiPartFile(teamID string, file multipart.File) *model.AppError {
+	team, getTeamErr := a.GetTeam(teamID)
+
+	if getTeamErr != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.set_team_icon.get_team.app_error", nil, "", http.StatusBadRequest).Wrap(getTeamErr)
+	}
+
+	if *a.Config().FileSettings.DriverName == "" {
+		return model.NewAppError("setTeamIcon", "api.team.set_team_icon.storage.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	if limitErr := checkImageLimits(file, *a.Config().FileSettings.MaxImageResolution); limitErr != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.set_team_icon.check_image_limits.app_error",
+			nil, "", http.StatusBadRequest).Wrap(limitErr)
+	}
+
+	return a.SetTeamIconFromFile(team, file)
+}
+
+func (a *App) SetTeamIconFromFile(team *model.Team, file io.Reader) *model.AppError {
+	// Decode image into Image object
+	img, _, err := image.Decode(file)
+	if err != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.set_team_icon.decode.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	orientation, _ := imaging.GetImageOrientation(file)
+	img = imaging.MakeImageUpright(img, orientation)
+
+	// Scale team icon
+	teamIconWidthAndHeight := 128
+	img = imaging.FillCenter(img, teamIconWidthAndHeight, teamIconWidthAndHeight)
+
+	buf := new(bytes.Buffer)
+	err = a.ch.imgEncoder.EncodePNG(buf, img)
+	if err != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.set_team_icon.encode.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	path := "teams/" + team.Id + "/teamIcon.png"
+
+	if _, err := a.WriteFile(buf, path); err != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.set_team_icon.write_file.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	curTime := model.GetMillis()
+
+	if err := a.Srv().Store().Team().UpdateLastTeamIconUpdate(team.Id, curTime); err != nil {
+		return model.NewAppError("SetTeamIcon", "api.team.team_icon.update.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	// manually set time to avoid possible cluster inconsistencies
+	team.LastTeamIconUpdate = curTime
+
+	if appErr := a.sendTeamEvent(team, model.WebsocketEventUpdateTeam); appErr != nil {
+		return appErr
+	}
+
+	return nil
+}
+
+func (a *App) RemoveTeamIcon(teamID string) *model.AppError {
+	team, err := a.GetTeam(teamID)
+	if err != nil {
+		return model.NewAppError("RemoveTeamIcon", "api.team.remove_team_icon.get_team.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	if err := a.Srv().Store().Team().UpdateLastTeamIconUpdate(teamID, 0); err != nil {
+		return model.NewAppError("RemoveTeamIcon", "api.team.team_icon.update.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	team.LastTeamIconUpdate = 0
+
+	if appErr := a.sendTeamEvent(team, model.WebsocketEventUpdateTeam); appErr != nil {
+		return appErr
+	}
+
+	return nil
+}
+
+func (a *App) InvalidateAllEmailInvites() *model.AppError {
+	if err := a.Srv().Store().Token().RemoveAllTokensByType(TokenTypeTeamInvitation); err != nil {
+		return model.NewAppError("InvalidateAllEmailInvites", "api.team.invalidate_all_email_invites.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	if err := a.Srv().Store().Token().RemoveAllTokensByType(TokenTypeGuestInvitation); err != nil {
+		return model.NewAppError("InvalidateAllEmailInvites", "api.team.invalidate_all_email_invites.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	if err := a.InvalidateAllResendInviteEmailJobs(); err != nil {
+		return model.NewAppError("InvalidateAllEmailInvites", "api.team.invalidate_all_email_invites.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return nil
+}
+
+func (a *App) InvalidateAllResendInviteEmailJobs() *model.AppError {
+	jobs, appErr := a.Srv().Jobs.GetJobsByTypeAndStatus(model.JobTypeResendInvitationEmail, model.JobStatusPending)
+	if appErr != nil {
+		return appErr
+	}
+
+	for _, j := range jobs {
+		a.Srv().Jobs.SetJobCanceled(j)
+		// clean up any system values this job was using
+		a.Srv().Store().System().PermanentDeleteByName(j.Id)
+	}
+
+	return nil
+}
+
+func (a *App) ClearTeamMembersCache(teamID string) error {
+	perPage := 100
+	page := 0
+
+	for {
+		teamMembers, err := a.Srv().Store().Team().GetMembers(teamID, page*perPage, perPage, nil)
+		if err != nil {
+			return fmt.Errorf("failed to get team members: %v", err)
+		}
+
+		for _, teamMember := range teamMembers {
+			a.ClearSessionCacheForUser(teamMember.UserId)
+
+			message := model.NewWebSocketEvent(model.WebsocketEventMemberroleUpdated, "", "", teamMember.UserId, nil, "")
+			tmJSON, jsonErr := json.Marshal(teamMember)
+			if jsonErr != nil {
+				return jsonErr
+			}
+			message.Add("member", string(tmJSON))
+			a.Publish(message)
+		}
+
+		length := len(teamMembers)
+		if length < perPage {
+			break
+		}
+
+		page++
+	}
+	return nil
+}
+
+func (a *App) GetNewTeamMembersSince(c request.CTX, teamID string, opts *model.InsightsOpts) (*model.NewTeamMembersList, int64, *model.AppError) {
+	if !a.Config().FeatureFlags.InsightsEnabled {
+		return nil, 0, model.NewAppError("GetNewTeamMembersSince", "app.insights.feature_disabled", nil, "", http.StatusNotImplemented)
+	}
+
+	ntms, count, err := a.Srv().Store().Team().GetNewTeamMembersSince(teamID, opts.StartUnixMilli, opts.Page*opts.PerPage, opts.PerPage)
+	if err != nil {
+		return nil, 0, model.NewAppError("GetNewTeamMembersSince", model.NoTranslation, nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return ntms, count, nil
 }

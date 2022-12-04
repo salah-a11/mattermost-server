@@ -1,78 +1,67 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
 
-	"github.com/mattermost/mattermost-server/v6/app"
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
-	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitTermsOfService() {
-	api.BaseRoutes.TermsOfService.Handle("", api.APISessionRequired(getLatestTermsOfService)).Methods("GET")
-	api.BaseRoutes.TermsOfService.Handle("", api.APISessionRequired(createTermsOfService)).Methods("POST")
+func (a *App) CreateTermsOfService(text, userID string) (*model.TermsOfService, *model.AppError) {
+	termsOfService := &model.TermsOfService{
+		Text:   text,
+		UserId: userID,
+	}
+
+	if _, appErr := a.GetUser(userID); appErr != nil {
+		return nil, appErr
+	}
+
+	var err error
+	if termsOfService, err = a.Srv().Store().TermsOfService().Save(termsOfService); err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("CreateTermsOfService", "app.terms_of_service.create.existing.app_error", nil, "id="+termsOfService.Id, http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("CreateTermsOfService", "app.terms_of_service.create.app_error", nil, "terms_of_service_id="+termsOfService.Id, http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return termsOfService, nil
 }
 
-func getLatestTermsOfService(c *Context, w http.ResponseWriter, r *http.Request) {
-	termsOfService, err := c.App.GetLatestTermsOfService()
+func (a *App) GetLatestTermsOfService() (*model.TermsOfService, *model.AppError) {
+	termsOfService, err := a.Srv().Store().TermsOfService().GetLatest(true)
 	if err != nil {
-		c.Err = err
-		return
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetLatestTermsOfService", "app.terms_of_service.get.no_rows.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetLatestTermsOfService", "app.terms_of_service.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
-
-	if err := json.NewEncoder(w).Encode(termsOfService); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return termsOfService, nil
 }
 
-func createTermsOfService(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionManageSystem) {
-		c.SetPermissionError(model.PermissionManageSystem)
-		return
-	}
-
-	if license := c.App.Channels().License(); license == nil || !*license.Features.CustomTermsOfService {
-		c.Err = model.NewAppError("createTermsOfService", "api.create_terms_of_service.custom_terms_of_service_disabled.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("createTermsOfService", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	props := model.MapFromJSON(r.Body)
-	text := props["text"]
-	userId := c.AppContext.Session().UserId
-
-	if text == "" {
-		c.Err = model.NewAppError("Config.IsValid", "api.create_terms_of_service.empty_text.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	oldTermsOfService, err := c.App.GetLatestTermsOfService()
-	if err != nil && err.Id != app.ErrorTermsOfServiceNoRowsFound {
-		c.Err = err
-		return
-	}
-
-	if oldTermsOfService == nil || oldTermsOfService.Text != text {
-		termsOfService, err := c.App.CreateTermsOfService(text, userId)
-		if err != nil {
-			c.Err = err
-			return
-		}
-
-		if err := json.NewEncoder(w).Encode(termsOfService); err != nil {
-			c.Logger.Warn("Error while writing response", mlog.Err(err))
-		}
-	} else {
-		if err := json.NewEncoder(w).Encode(oldTermsOfService); err != nil {
-			c.Logger.Warn("Error while writing response", mlog.Err(err))
+func (a *App) GetTermsOfService(id string) (*model.TermsOfService, *model.AppError) {
+	termsOfService, err := a.Srv().Store().TermsOfService().Get(id, true)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetTermsOfService", "app.terms_of_service.get.no_rows.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetTermsOfService", "app.terms_of_service.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
 	}
-	auditRec.Success()
+	return termsOfService, nil
 }

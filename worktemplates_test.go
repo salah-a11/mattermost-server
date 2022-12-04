@@ -1,110 +1,125 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"os"
 	"testing"
 
-	"github.com/mattermost/mattermost-server/v6/app/worktemplates"
 	"github.com/stretchr/testify/require"
+
+	"github.com/mattermost/mattermost-server/v6/app/worktemplates"
 )
 
-func TestWorkTemplateCategories(t *testing.T) {
-	// Setup
-	cleanup := setupWorktemplateFeatureFlag(t)
-	defer cleanup()
-
-	th := Setup(t).InitBasic()
+func TestGetWorkTemplateCategories(t *testing.T) {
+	th := SetupWithStoreMock(t)
 	defer th.TearDown()
 	assert := require.New(t)
 
-	worktemplates.OrderedWorkTemplateCategories = []*worktemplates.WorkTemplateCategory{
-		{
-			ID:   "test-category",
-			Name: "Test Category",
-		},
-		{
-			ID:   "test-category-2",
-			Name: "Test Category 2",
-		},
-	}
+	worktemplates.OrderedWorkTemplateCategories = wtGetCategories()
 
-	// Act
-	categories, _, clientErr := th.Client.GetWorktemplateCategories()
-
-	// Assert
-	require.NoError(t, clientErr)
-	require.Len(t, categories, 2)
-	assert.Equal("test-category", categories[0].ID)
-	assert.Equal("test-category-2", categories[1].ID)
+	categories, appErr := th.App.GetWorkTemplateCategories(wtTranslationFunc)
+	assert.Nil(appErr)
+	assert.Len(categories, 2)
+	assert.Equal("Translated test.1", categories[0].Name)
+	assert.Equal("Translated test.2", categories[1].Name)
 }
 
 func TestGetWorkTemplatesByCategory(t *testing.T) {
 	// Setup
-	cleanup := setupWorktemplateFeatureFlag(t)
-	defer cleanup()
-
-	th := Setup(t).InitBasic()
+	th := SetupWithStoreMock(t)
 	defer th.TearDown()
 	assert := require.New(t)
 
-	worktemplates.OrderedWorkTemplateCategories = []*worktemplates.WorkTemplateCategory{
-		{
-			ID:   "test-category",
-			Name: "Test Category",
-		},
-		{
-			ID:   "test-category-2",
-			Name: "Test Category 2",
-		},
+	existingFFkey := "test-feature-flag"
+	existingFFvalue := "true"
+	ff := map[string]string{
+		existingFFkey: existingFFvalue,
 	}
 
+	worktemplates.OrderedWorkTemplateCategories = wtGetCategories()
+	firstCat := worktemplates.OrderedWorkTemplateCategories[0]
 	worktemplates.OrderedWorkTemplates = []*worktemplates.WorkTemplate{
 		{
 			ID:       "test-template",
-			Category: "test-category",
-			UseCase:  "Test Template",
+			Category: firstCat.ID,
+			UseCase:  "test use case",
+			Description: worktemplates.Description{
+				Channel: &worktemplates.TranslatableString{
+					ID:             "test-template-channel-description",
+					DefaultMessage: "test template channel description",
+				},
+			},
 		},
-		{
+		{ // this one should not be returned because of the FF
 			ID:       "test-template-2",
-			Category: "test-category",
-			UseCase:  "Test Template 2",
-		},
-		{ // This one should not be returned because of the feature flag
-			ID:       "test-template-3",
-			Category: "test-category",
-			UseCase:  "Test Template 3",
+			Category: firstCat.ID,
+			UseCase:  "test use case 2",
 			FeatureFlag: &worktemplates.FeatureFlag{
-				Name:  "random-nonexistant-feature-flag",
-				Value: "true",
+				Name:  "nonexistant-random-test-feature-flag",
+				Value: "hi",
+			},
+			Description: worktemplates.Description{
+				Channel: &worktemplates.TranslatableString{
+					ID:             "test-template-2-channel-description",
+					DefaultMessage: "test template 2 channel description",
+				},
+			},
+		},
+		{ // this one should be present and match the FF
+			ID:       "test-template-3",
+			Category: firstCat.ID,
+			UseCase:  "test use case 3",
+			FeatureFlag: &worktemplates.FeatureFlag{
+				Name:  existingFFkey,
+				Value: existingFFvalue,
+			},
+			Description: worktemplates.Description{
+				Channel: &worktemplates.TranslatableString{
+					ID:             "unknown", // simulating an unknown translation, we return the default message in this case
+					DefaultMessage: "default message picked for unknown",
+				},
 			},
 		},
 		{ // this one should not be returned because of the category
 			ID:       "test-template-4",
-			Category: "test-category-2",
-			UseCase:  "Test Template 4",
+			Category: "cat-test2",
+			UseCase:  "test use case 4",
 		},
 	}
 
 	// Act
-	workTemplates, _, clientErr := th.Client.GetWorkTemplatesByCategory("test-category")
+	worktemplates, appErr := th.App.GetWorkTemplates(firstCat.ID, ff, wtTranslationFunc)
 
 	// Assert
-	assert.NoError(clientErr, "error while retrieve worktemplates list")
-	assert.Len(workTemplates, 2)
-	assert.Equal("test-template", workTemplates[0].ID)
-	assert.Equal("test-template-2", workTemplates[1].ID)
+	assert.Nil(appErr)
+	assert.Len(worktemplates, 2)
+	// assert the correct work templates have been returned
+	assert.Equal("test-template", worktemplates[0].ID)
+	assert.Equal("test-template-3", worktemplates[1].ID)
+	// assert the descriptions have been translated
+	assert.Equal("Translated test-template-channel-description", worktemplates[0].Description.Channel.Message)
+	assert.Equal("default message picked for unknown", worktemplates[1].Description.Channel.Message)
 }
 
-func setupWorktemplateFeatureFlag(t *testing.T) func() {
-	t.Helper()
+// helpers
+func wtTranslationFunc(id string, args ...interface{}) string {
+	if id == "unknown" {
+		return ""
+	}
 
-	oldFFValue := os.Getenv("MM_FEATUREFLAGS_WORKTEMPLATE")
-	os.Setenv("MM_FEATUREFLAGS_WORKTEMPLATE", "true")
+	return "Translated " + id
+}
 
-	return func() {
-		os.Setenv("MM_FEATUREFLAGS_WORKTEMPLATE", oldFFValue)
+func wtGetCategories() []*worktemplates.WorkTemplateCategory {
+	return []*worktemplates.WorkTemplateCategory{
+		{
+			ID:   "cat-test1",
+			Name: "test.1",
+		},
+		{
+			ID:   "cat-test2",
+			Name: "test.2",
+		},
 	}
 }
