@@ -1,7 +1,7 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
 	"flag"
@@ -10,6 +10,7 @@ import (
 	"github.com/mattermost/mattermost-server/v6/testlib"
 )
 
+var mainHelper *testlib.MainHelper
 var replicaFlag bool
 
 func TestMain(m *testing.M) {

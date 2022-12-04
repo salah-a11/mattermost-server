@@ -1,477 +1,218 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
-	"io"
+	"fmt"
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mattermost/mattermost-server/v6/model"
 )
 
 func TestCreateBot(t *testing.T) {
-	t.Run("create bot without permissions", func(t *testing.T) {
-		th := Setup(t)
-		defer th.TearDown()
+	t.Run("invalid bot", func(t *testing.T) {
+		t.Run("relative to user", func(t *testing.T) {
+			th := Setup(t).InitBasic()
+			defer th.TearDown()
 
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+			_, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    "invalid username",
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.username.app_error", err.Id)
 		})
 
-		_, _, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
+		t.Run("relative to bot", func(t *testing.T) {
+			th := Setup(t).InitBasic()
+			defer th.TearDown()
+
+			_, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    "username",
+				Description: strings.Repeat("x", 1025),
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.description.app_error", err.Id)
 		})
 
-		CheckErrorID(t, err, "api.context.permissions.app_error")
+		t.Run("username contains . character", func(t *testing.T) {
+			th := Setup(t).InitBasic()
+			defer th.TearDown()
+
+			bot, err := th.App.CreateBot(th.Context, &model.Bot{
+				Username:    "username.",
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Nil(t, bot)
+			require.Equal(t, "model.user.is_valid.email.app_error", err.Id)
+		})
+
+		t.Run("username missing", func(t *testing.T) {
+			th := Setup(t).InitBasic()
+			defer th.TearDown()
+			bot, err := th.App.CreateBot(th.Context, &model.Bot{
+				Description: "a bot",
+				OwnerId:     th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Nil(t, bot)
+			require.Equal(t, "model.bot.is_valid.username.app_error", err.Id)
+		})
 	})
 
-	t.Run("create bot without config permissions", func(t *testing.T) {
+	t.Run("create bot", func(t *testing.T) {
 		th := Setup(t).InitBasic()
 		defer th.TearDown()
 
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.Config().ServiceSettings.EnableBotAccountCreation = model.NewBool(false)
-
-		_, _, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-
-		CheckErrorID(t, err, "api.bot.create_disabled")
-	})
-
-	t.Run("create bot with permissions", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		}
-
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-		require.Equal(t, bot.Username, createdBot.Username)
-		require.Equal(t, bot.DisplayName, createdBot.DisplayName)
-		require.Equal(t, bot.Description, createdBot.Description)
-		require.Equal(t, th.BasicUser.Id, createdBot.OwnerId)
-	})
-
-	t.Run("create invalid bot", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		_, _, err := th.Client.CreateBot(&model.Bot{
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
 			Username:    "username",
-			DisplayName: "a bot",
-			Description: strings.Repeat("x", 1025),
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
 		})
+		require.Nil(t, err)
+		defer th.App.PermanentDeleteBot(bot.UserId)
+		assert.Equal(t, "username", bot.Username)
+		assert.Equal(t, "a bot", bot.Description)
+		assert.Equal(t, th.BasicUser.Id, bot.OwnerId)
 
-		CheckErrorID(t, err, "model.bot.is_valid.description.app_error")
+		user, err := th.App.GetUser(bot.UserId)
+		require.Nil(t, err)
+
+		// Check that a post was created to add bot to team and channels
+		channel, err := th.App.getOrCreateDirectChannelWithUser(th.Context, user, th.BasicUser)
+		require.Nil(t, err)
+		posts, err := th.App.GetPosts(channel.Id, 0, 1)
+		require.Nil(t, err)
+
+		postArray := posts.ToSlice()
+		assert.Len(t, postArray, 1)
+		assert.Equal(t, postArray[0].Type, model.PostTypeAddBotTeamsChannels)
 	})
 
-	t.Run("bot attempt to create bot fails", func(t *testing.T) {
+	t.Run("create bot, username already used by a non-bot user", func(t *testing.T) {
 		th := Setup(t).InitBasic()
 		defer th.TearDown()
 
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+		_, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    th.BasicUser.Username,
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
 		})
-
-		th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.EnableUserAccessTokens = true })
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionEditOtherUsers.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId+" "+model.SystemUserAccessTokenRoleId, false)
-
-		bot, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(bot.UserId)
-		th.App.UpdateUserRoles(th.Context, bot.UserId, model.TeamUserRoleId+" "+model.SystemUserAccessTokenRoleId, false)
-
-		rtoken, _, err := th.Client.CreateUserAccessToken(bot.UserId, "test token")
-		require.NoError(t, err)
-		th.Client.AuthToken = rtoken.Token
-
-		_, _, err = th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			OwnerId:     bot.UserId,
-			DisplayName: "a bot2",
-			Description: "bot2",
-		})
-		CheckErrorID(t, err, "api.context.permissions.app_error")
+		require.NotNil(t, err)
+		require.Equal(t, "app.user.save.username_exists.app_error", err.Id)
 	})
-
 }
 
 func TestPatchBot(t *testing.T) {
-	t.Run("patch non-existent bot", func(t *testing.T) {
-		th := Setup(t)
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-			_, resp, err := client.PatchBot(model.NewId(), &model.BotPatch{})
-			require.Error(t, err)
-			CheckNotFoundStatus(t, resp)
-		})
-	})
-
-	t.Run("system admin and local client can patch any bot", func(t *testing.T) {
+	t.Run("invalid patch for user", func(t *testing.T) {
 		th := Setup(t).InitBasic()
 		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
 
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
 		})
-
-		createdBot, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot created by a user",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-			botPatch := &model.BotPatch{
-				Username:    sToP(GenerateTestUsername()),
-				DisplayName: sToP("an updated bot"),
-				Description: sToP("updated bot"),
-			}
-			patchedBot, patchResp, err2 := client.PatchBot(createdBot.UserId, botPatch)
-			require.NoError(t, err2)
-			CheckOKStatus(t, patchResp)
-			require.Equal(t, *botPatch.Username, patchedBot.Username)
-			require.Equal(t, *botPatch.DisplayName, patchedBot.DisplayName)
-			require.Equal(t, *botPatch.Description, patchedBot.Description)
-			require.Equal(t, th.BasicUser.Id, patchedBot.OwnerId)
-		}, "bot created by user")
-
-		createdBotSystemAdmin, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "another bot",
-			Description: "bot created by system admin user",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBotSystemAdmin.UserId)
-
-		th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-			botPatch := &model.BotPatch{
-				Username:    sToP(GenerateTestUsername()),
-				DisplayName: sToP("an updated bot"),
-				Description: sToP("updated bot"),
-			}
-			patchedBot, patchResp, err := client.PatchBot(createdBotSystemAdmin.UserId, botPatch)
-			require.NoError(t, err)
-			CheckOKStatus(t, patchResp)
-			require.Equal(t, *botPatch.Username, patchedBot.Username)
-			require.Equal(t, *botPatch.DisplayName, patchedBot.DisplayName)
-			require.Equal(t, *botPatch.Description, patchedBot.Description)
-			require.Equal(t, th.SystemAdminUser.Id, patchedBot.OwnerId)
-		}, "bot created by system admin")
-	})
-
-	t.Run("patch someone else's bot without permission", func(t *testing.T) {
-		th := Setup(t)
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		createdBot, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		_, _, err = th.Client.PatchBot(createdBot.UserId, &model.BotPatch{})
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
-	})
-
-	t.Run("patch someone else's bot without permission, but with read others permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		createdBot, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		_, _, err = th.Client.PatchBot(createdBot.UserId, &model.BotPatch{})
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-	})
-
-	t.Run("patch someone else's bot with permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionManageOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		createdBot, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
+		require.Nil(t, err)
+		defer th.App.PermanentDeleteBot(bot.UserId)
 
 		botPatch := &model.BotPatch{
-			Username:    sToP(GenerateTestUsername()),
+			Username:    sToP("invalid username"),
 			DisplayName: sToP("an updated bot"),
 			Description: sToP("updated bot"),
 		}
 
-		patchedBot, resp, err := th.Client.PatchBot(createdBot.UserId, botPatch)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, *botPatch.Username, patchedBot.Username)
-		require.Equal(t, *botPatch.DisplayName, patchedBot.DisplayName)
-		require.Equal(t, *botPatch.Description, patchedBot.Description)
-		require.Equal(t, th.SystemAdminUser.Id, patchedBot.OwnerId)
-
-		// Continue through the bot update process (call UpdateUserRoles), then
-		// get the bot, to make sure the patched bot was correctly saved.
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageRoles.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		resp, err = th.Client.UpdateUserRoles(createdBot.UserId, model.SystemUserRoleId)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		bots, resp, err := th.Client.GetBots(0, 2, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Len(t, bots, 1)
-		require.Equal(t, []*model.Bot{patchedBot}, bots)
+		_, err = th.App.PatchBot(bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "model.user.is_valid.username.app_error", err.Id)
 	})
 
-	t.Run("patch my bot without permission", func(t *testing.T) {
+	t.Run("invalid patch for bot", func(t *testing.T) {
 		th := Setup(t).InitBasic()
 		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
 
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
 		})
-
-		createdBot, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
+		require.Nil(t, err)
+		defer th.App.PermanentDeleteBot(bot.UserId)
 
 		botPatch := &model.BotPatch{
-			Username:    sToP(GenerateTestUsername()),
-			DisplayName: sToP("an updated bot"),
-			Description: sToP("updated bot"),
+			Username:    sToP("username"),
+			DisplayName: sToP("display name"),
+			Description: sToP(strings.Repeat("x", 1025)),
 		}
 
-		_, _, err = th.Client.PatchBot(createdBot.UserId, botPatch)
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
+		_, err = th.App.PatchBot(bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "model.bot.is_valid.description.app_error", err.Id)
 	})
 
-	t.Run("patch my bot without permission, but with read permission", func(t *testing.T) {
+	t.Run("patch bot", func(t *testing.T) {
 		th := Setup(t).InitBasic()
 		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		createdBot, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		botPatch := &model.BotPatch{
-			Username:    sToP(GenerateTestUsername()),
-			DisplayName: sToP("an updated bot"),
-			Description: sToP("updated bot"),
-		}
-
-		_, _, err = th.Client.PatchBot(createdBot.UserId, botPatch)
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-	})
-
-	t.Run("patch my bot with permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		createdBot, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		botPatch := &model.BotPatch{
-			Username:    sToP(GenerateTestUsername()),
-			DisplayName: sToP("an updated bot"),
-			Description: sToP("updated bot"),
-		}
-
-		patchedBot, resp, err := th.Client.PatchBot(createdBot.UserId, botPatch)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, *botPatch.Username, patchedBot.Username)
-		require.Equal(t, *botPatch.DisplayName, patchedBot.DisplayName)
-		require.Equal(t, *botPatch.Description, patchedBot.Description)
-		require.Equal(t, th.BasicUser.Id, patchedBot.OwnerId)
-	})
-
-	t.Run("partial patch my bot with permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
 
 		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
+			Username:    "username",
+			DisplayName: "bot",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
 		}
 
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
+		createdBot, err := th.App.CreateBot(th.Context, bot)
+		require.Nil(t, err)
 		defer th.App.PermanentDeleteBot(createdBot.UserId)
 
 		botPatch := &model.BotPatch{
-			Username: sToP(GenerateTestUsername()),
+			Username:    sToP("username2"),
+			DisplayName: sToP("updated bot"),
+			Description: sToP("an updated bot"),
 		}
 
-		patchedBot, resp, err := th.Client.PatchBot(createdBot.UserId, botPatch)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, *botPatch.Username, patchedBot.Username)
-		require.Equal(t, bot.DisplayName, patchedBot.DisplayName)
-		require.Equal(t, bot.Description, patchedBot.Description)
-		require.Equal(t, th.BasicUser.Id, patchedBot.OwnerId)
+		patchedBot, err := th.App.PatchBot(createdBot.UserId, botPatch)
+		require.Nil(t, err)
+
+		// patchedBot should create a new .UpdateAt time
+		require.NotEqual(t, createdBot.UpdateAt, patchedBot.UpdateAt)
+
+		createdBot.Username = "username2"
+		createdBot.DisplayName = "updated bot"
+		createdBot.Description = "an updated bot"
+		createdBot.UpdateAt = patchedBot.UpdateAt
+		require.Equal(t, createdBot, patchedBot)
 	})
 
-	t.Run("update bot, internally managed fields ignored", func(t *testing.T) {
+	t.Run("patch bot, username already used by a non-bot user", func(t *testing.T) {
 		th := Setup(t).InitBasic()
 		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
 
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			DisplayName: "bot",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
 		})
+		require.Nil(t, err)
+		defer th.App.PermanentDeleteBot(bot.UserId)
 
-		createdBot, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
+		botPatch := &model.BotPatch{
+			Username: sToP(th.BasicUser2.Username),
+		}
 
-		r, err := th.Client.DoAPIPut("/bots/"+createdBot.UserId, `{"creator_id":"`+th.BasicUser2.Id+`"}`)
-		require.NoError(t, err)
-		defer func() {
-			_, _ = io.ReadAll(r.Body)
-			_ = r.Body.Close()
-		}()
-		var patchedBot *model.Bot
-		err = json.NewDecoder(r.Body).Decode(&patchedBot)
-		require.NoError(t, err)
-
-		resp = model.BuildResponse(r)
-		CheckOKStatus(t, resp)
-
-		require.Equal(t, th.BasicUser.Id, patchedBot.OwnerId)
+		_, err = th.App.PatchBot(bot.UserId, botPatch)
+		require.NotNil(t, err)
+		require.Equal(t, "app.user.save.username_exists.app_error", err.Id)
 	})
 }
 
@@ -479,878 +220,582 @@ func TestGetBot(t *testing.T) {
 	th := Setup(t).InitBasic()
 	defer th.TearDown()
 
-	th.App.UpdateConfig(func(cfg *model.Config) {
-		*cfg.ServiceSettings.EnableBotAccountCreation = true
+	bot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     th.BasicUser.Id,
 	})
-
-	bot1, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		DisplayName: "a bot",
-		Description: "the first bot",
-	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(bot1.UserId)
 
-	bot2, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		DisplayName: "another bot",
-		Description: "the second bot",
+	bot2, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username2",
+		Description: "a second bot",
+		OwnerId:     th.BasicUser.Id,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(bot2.UserId)
 
-	deletedBot, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
+	deletedBot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username3",
 		Description: "a deleted bot",
+		OwnerId:     th.BasicUser.Id,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
+	deletedBot, err = th.App.UpdateBotActive(th.Context, deletedBot.UserId, false)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(deletedBot.UserId)
-	deletedBot, resp, err = th.SystemAdminClient.DisableBot(deletedBot.UserId)
-	require.NoError(t, err)
-	CheckOKStatus(t, resp)
-
-	th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-	th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-	th.App.UpdateConfig(func(cfg *model.Config) {
-		*cfg.ServiceSettings.EnableBotAccountCreation = true
-	})
-
-	myBot, resp, err := th.Client.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		DisplayName: "my bot",
-		Description: "a bot created by non-admin",
-	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
-	defer th.App.PermanentDeleteBot(myBot.UserId)
-	th.RemovePermissionFromRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
 
 	t.Run("get unknown bot", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		_, resp, err := th.Client.GetBot(model.NewId(), "")
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+		_, err := th.App.GetBot(model.NewId(), false)
+		require.NotNil(t, err)
+		require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
 	})
 
 	t.Run("get bot1", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		bot, resp, err := th.Client.GetBot(bot1.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, bot1, bot)
-
-		bot, resp, _ = th.Client.GetBot(bot1.UserId, bot.Etag())
-		CheckEtag(t, bot, resp)
+		bot, err := th.App.GetBot(bot1.UserId, false)
+		require.Nil(t, err)
+		assert.Equal(t, bot1, bot)
 	})
 
 	t.Run("get bot2", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		bot, resp, err := th.Client.GetBot(bot2.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, bot2, bot)
-
-		bot, resp, _ = th.Client.GetBot(bot2.UserId, bot.Etag())
-		CheckEtag(t, bot, resp)
-	})
-
-	t.Run("get bot1 without PermissionReadOthersBots permission", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		_, _, err := th.Client.GetBot(bot1.UserId, "")
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
-	})
-
-	t.Run("get myBot without ReadBots OR ReadOthersBots permissions", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		_, _, err := th.Client.GetBot(myBot.UserId, "")
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
+		bot, err := th.App.GetBot(bot2.UserId, false)
+		require.Nil(t, err)
+		assert.Equal(t, bot2, bot)
 	})
 
 	t.Run("get deleted bot", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		_, resp, err := th.Client.GetBot(deletedBot.UserId, "")
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+		_, err := th.App.GetBot(deletedBot.UserId, false)
+		require.NotNil(t, err)
+		require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
 	})
 
 	t.Run("get deleted bot, include deleted", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		bot, resp, err := th.Client.GetBotIncludeDeleted(deletedBot.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.NotEqual(t, 0, bot.DeleteAt)
-		deletedBot.UpdateAt = bot.UpdateAt
-		deletedBot.DeleteAt = bot.DeleteAt
-		require.Equal(t, deletedBot, bot)
-
-		bot, resp, _ = th.Client.GetBotIncludeDeleted(deletedBot.UserId, bot.Etag())
-		CheckEtag(t, bot, resp)
+		bot, err := th.App.GetBot(deletedBot.UserId, true)
+		require.Nil(t, err)
+		assert.Equal(t, deletedBot, bot)
 	})
 }
 
 func TestGetBots(t *testing.T) {
-	th := Setup(t).InitBasic()
+	th := Setup(t)
 	defer th.TearDown()
 
-	th.App.UpdateConfig(func(cfg *model.Config) {
-		*cfg.ServiceSettings.EnableBotAccountCreation = true
-	})
+	OwnerId1 := model.NewId()
+	OwnerId2 := model.NewId()
 
-	bot1, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		DisplayName: "a bot",
-		Description: "the first bot",
+	bot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     OwnerId1,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(bot1.UserId)
 
-	deletedBot1, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
+	deletedBot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username4",
 		Description: "a deleted bot",
+		OwnerId:     OwnerId1,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
+	deletedBot1, err = th.App.UpdateBotActive(th.Context, deletedBot1.UserId, false)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(deletedBot1.UserId)
-	deletedBot1, resp, err = th.SystemAdminClient.DisableBot(deletedBot1.UserId)
-	require.NoError(t, err)
-	CheckOKStatus(t, resp)
 
-	bot2, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		DisplayName: "another bot",
-		Description: "the second bot",
+	bot2, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username2",
+		Description: "a second bot",
+		OwnerId:     OwnerId1,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(bot2.UserId)
 
-	bot3, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		DisplayName: "another bot",
-		Description: "the third bot",
+	bot3, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username3",
+		Description: "a third bot",
+		OwnerId:     OwnerId1,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
+	require.Nil(t, err)
 	defer th.App.PermanentDeleteBot(bot3.UserId)
 
-	deletedBot2, resp, err := th.SystemAdminClient.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		Description: "a deleted bot",
+	bot4, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username5",
+		Description: "a fourth bot",
+		OwnerId:     OwnerId2,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
-	defer th.App.PermanentDeleteBot(deletedBot2.UserId)
-	deletedBot2, resp, err = th.SystemAdminClient.DisableBot(deletedBot2.UserId)
-	require.NoError(t, err)
-	CheckOKStatus(t, resp)
+	require.Nil(t, err)
+	defer th.App.PermanentDeleteBot(bot4.UserId)
 
-	th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-	th.App.UpdateUserRoles(th.Context, th.BasicUser2.Id, model.TeamUserRoleId, false)
-	th.LoginBasic2()
-	orphanedBot, resp, err := th.Client.CreateBot(&model.Bot{
-		Username:    GenerateTestUsername(),
-		Description: "an orphaned bot",
+	deletedBot2, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username6",
+		Description: "a deleted bot",
+		OwnerId:     OwnerId2,
 	})
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
-	th.LoginBasic()
-	defer th.App.PermanentDeleteBot(orphanedBot.UserId)
-	// Automatic deactivation disabled
-	th.App.UpdateConfig(func(cfg *model.Config) {
-		*cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = false
-	})
-	resp, err = th.SystemAdminClient.DeleteUser(th.BasicUser2.Id)
-	require.NoError(t, err)
-	CheckOKStatus(t, resp)
+	require.Nil(t, err)
+	deletedBot2, err = th.App.UpdateBotActive(th.Context, deletedBot2.UserId, false)
+	require.Nil(t, err)
+	defer th.App.PermanentDeleteBot(deletedBot2.UserId)
 
 	t.Run("get bots, page=0, perPage=10", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{bot1, bot2, bot3, orphanedBot}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBots(0, 10, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        "",
+			IncludeDeleted: false,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBots(0, 10, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1, bot2, bot3, bot4}, bots)
 	})
 
 	t.Run("get bots, page=0, perPage=1", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{bot1}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBots(0, 1, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        1,
+			OwnerId:        "",
+			IncludeDeleted: false,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBots(0, 1, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1}, bots)
 	})
 
 	t.Run("get bots, page=1, perPage=2", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{bot3, orphanedBot}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBots(1, 2, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           1,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: false,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBots(1, 2, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot3, bot4}, bots)
 	})
 
 	t.Run("get bots, page=2, perPage=2", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBots(2, 2, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           2,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: false,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBots(2, 2, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{}, bots)
 	})
 
 	t.Run("get bots, page=0, perPage=10, include deleted", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{bot1, deletedBot1, bot2, bot3, deletedBot2, orphanedBot}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBotsIncludeDeleted(0, 10, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        "",
+			IncludeDeleted: true,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBotsIncludeDeleted(0, 10, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1, deletedBot1, bot2, bot3, bot4, deletedBot2}, bots)
 	})
 
 	t.Run("get bots, page=0, perPage=1, include deleted", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{bot1}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBotsIncludeDeleted(0, 1, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        1,
+			OwnerId:        "",
+			IncludeDeleted: true,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBotsIncludeDeleted(0, 1, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot1}, bots)
 	})
 
 	t.Run("get bots, page=1, perPage=2, include deleted", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{bot2, bot3}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBotsIncludeDeleted(1, 2, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           1,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: true,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBotsIncludeDeleted(1, 2, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot2, bot3}, bots)
 	})
 
 	t.Run("get bots, page=2, perPage=2, include deleted", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{deletedBot2, orphanedBot}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBotsIncludeDeleted(2, 2, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           2,
+			PerPage:        2,
+			OwnerId:        "",
+			IncludeDeleted: true,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBotsIncludeDeleted(2, 2, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		assert.Equal(t, model.BotList{bot4, deletedBot2}, bots)
 	})
 
-	t.Run("get bots, page=0, perPage=10, only orphaned", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		expectedBotList := []*model.Bot{orphanedBot}
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bots, resp, err := client.GetBotsOrphaned(0, 10, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, expectedBotList, bots)
+	t.Run("get offset=0, limit=10, creator id 1", func(t *testing.T) {
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId1,
+			IncludeDeleted: false,
 		})
-
-		botList := model.BotList(expectedBotList)
-		bots, resp, _ := th.Client.GetBotsOrphaned(0, 10, botList.Etag())
-		CheckEtag(t, bots, resp)
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot1, bot2, bot3}, bots)
 	})
 
-	t.Run("get bots without permission", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageOthersBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-
-		_, _, err := th.Client.GetBots(0, 10, "")
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-	})
-}
-
-func TestDisableBot(t *testing.T) {
-	t.Run("disable non-existent bot", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			_, resp, err := client.DisableBot(model.NewId())
-			require.Error(t, err)
-			CheckNotFoundStatus(t, resp)
+	t.Run("get offset=0, limit=10, creator id 2", func(t *testing.T) {
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId2,
+			IncludeDeleted: false,
 		})
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot4}, bots)
 	})
 
-	t.Run("disable bot without permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+	t.Run("get offset=0, limit=10, include deleted, creator id 1", func(t *testing.T) {
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId1,
+			IncludeDeleted: true,
 		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		_, _, err = th.Client.DisableBot(createdBot.UserId)
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot1, deletedBot1, bot2, bot3}, bots)
 	})
 
-	t.Run("disable bot without permission, but with read permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
+	t.Run("get offset=0, limit=10, include deleted, creator id 2", func(t *testing.T) {
+		bots, err := th.App.GetBots(&model.BotGetOptions{
+			Page:           0,
+			PerPage:        10,
+			OwnerId:        OwnerId2,
+			IncludeDeleted: true,
 		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		_, _, err = th.Client.DisableBot(createdBot.UserId)
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-	})
-
-	t.Run("disable bot with permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bot, resp, err := th.Client.CreateBot(&model.Bot{
-				Username:    GenerateTestUsername(),
-				Description: "bot",
-			})
-			require.NoError(t, err)
-			CheckCreatedStatus(t, resp)
-			defer th.App.PermanentDeleteBot(bot.UserId)
-
-			disabledBot, resp, err := client.DisableBot(bot.UserId)
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			bot.UpdateAt = disabledBot.UpdateAt
-			bot.DeleteAt = disabledBot.DeleteAt
-			require.Equal(t, bot, disabledBot)
-
-			// Check bot disabled
-			disab, resp, err := th.SystemAdminClient.GetBotIncludeDeleted(bot.UserId, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.NotZero(t, disab.DeleteAt)
-
-			// Disabling should be idempotent.
-			disabledBot2, resp, err := client.DisableBot(bot.UserId)
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, bot, disabledBot2)
-		})
-	})
-}
-func TestEnableBot(t *testing.T) {
-	t.Run("enable non-existent bot", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			_, resp, err := th.Client.EnableBot(model.NewId())
-			require.Error(t, err)
-			CheckNotFoundStatus(t, resp)
-		})
-	})
-
-	t.Run("enable bot without permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		_, resp, err = th.SystemAdminClient.DisableBot(createdBot.UserId)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		_, _, err = th.Client.EnableBot(createdBot.UserId)
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
-	})
-
-	t.Run("enable bot without permission, but with read permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		_, resp, err = th.SystemAdminClient.DisableBot(createdBot.UserId)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		_, _, err = th.Client.EnableBot(createdBot.UserId)
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-	})
-
-	t.Run("enable bot with permission", func(t *testing.T) {
-		th := Setup(t).InitBasic()
-		defer th.TearDown()
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.TeamUserRoleId)
-		th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			bot, resp, err := th.Client.CreateBot(&model.Bot{
-				Username:    GenerateTestUsername(),
-				Description: "bot",
-			})
-			require.NoError(t, err)
-			CheckCreatedStatus(t, resp)
-			defer th.App.PermanentDeleteBot(bot.UserId)
-
-			_, resp, err = th.SystemAdminClient.DisableBot(bot.UserId)
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-
-			enabledBot1, resp, err := client.EnableBot(bot.UserId)
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			bot.UpdateAt = enabledBot1.UpdateAt
-			bot.DeleteAt = enabledBot1.DeleteAt
-			require.Equal(t, bot, enabledBot1)
-
-			// Check bot enabled
-			enab, resp, err := th.SystemAdminClient.GetBotIncludeDeleted(bot.UserId, "")
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Zero(t, enab.DeleteAt)
-
-			// Disabling should be idempotent.
-			enabledBot2, resp, err := client.EnableBot(bot.UserId)
-			require.NoError(t, err)
-			CheckOKStatus(t, resp)
-			require.Equal(t, bot, enabledBot2)
-		})
+		require.Nil(t, err)
+		require.Equal(t, model.BotList{bot4, deletedBot2}, bots)
 	})
 }
 
-func TestAssignBot(t *testing.T) {
+func TestUpdateBotActive(t *testing.T) {
+	t.Run("unknown bot", func(t *testing.T) {
+		th := Setup(t).InitBasic()
+		defer th.TearDown()
+
+		_, err := th.App.UpdateBotActive(th.Context, model.NewId(), false)
+		require.NotNil(t, err)
+		require.Equal(t, "app.user.missing_account.const", err.Id)
+	})
+
+	t.Run("disable/enable bot", func(t *testing.T) {
+		th := Setup(t).InitBasic()
+		defer th.TearDown()
+
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    "username",
+			Description: "a bot",
+			OwnerId:     th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer th.App.PermanentDeleteBot(bot.UserId)
+
+		disabledBot, err := th.App.UpdateBotActive(th.Context, bot.UserId, false)
+		require.Nil(t, err)
+		require.NotEqual(t, 0, disabledBot.DeleteAt)
+
+		// Disabling should be idempotent
+		disabledBotAgain, err := th.App.UpdateBotActive(th.Context, bot.UserId, false)
+		require.Nil(t, err)
+		require.Equal(t, disabledBot.DeleteAt, disabledBotAgain.DeleteAt)
+
+		reenabledBot, err := th.App.UpdateBotActive(th.Context, bot.UserId, true)
+		require.Nil(t, err)
+		require.EqualValues(t, 0, reenabledBot.DeleteAt)
+
+		// Re-enabling should be idempotent
+		reenabledBotAgain, err := th.App.UpdateBotActive(th.Context, bot.UserId, true)
+		require.Nil(t, err)
+		require.Equal(t, reenabledBot.DeleteAt, reenabledBotAgain.DeleteAt)
+	})
+}
+
+func TestPermanentDeleteBot(t *testing.T) {
 	th := Setup(t).InitBasic()
 	defer th.TearDown()
 
-	t.Run("claim non-existent bot", func(t *testing.T) {
-		th.TestForAllClients(t, func(t *testing.T, client *model.Client4) {
-			_, resp, err := client.AssignBot(model.NewId(), model.NewId())
-			require.Error(t, err)
-			CheckNotFoundStatus(t, resp)
-		})
+	bot, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username",
+		Description: "a bot",
+		OwnerId:     th.BasicUser.Id,
 	})
+	require.Nil(t, err)
 
-	t.Run("system admin and local mode assign bot", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
+	require.Nil(t, th.App.PermanentDeleteBot(bot.UserId))
 
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.SystemUserRoleId)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-		bot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(bot.UserId)
-
-		before, resp, err := th.Client.GetBot(bot.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, th.BasicUser.Id, before.OwnerId)
-
-		_, resp, err = th.SystemAdminClient.AssignBot(bot.UserId, th.SystemAdminUser.Id)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		// Original owner doesn't have read others bots permission, therefore can't see bot anymore
-		_, resp, err = th.Client.GetBot(bot.UserId, "")
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
-
-		// System admin can see creator ID has changed
-		after, resp, err := th.SystemAdminClient.GetBot(bot.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, th.SystemAdminUser.Id, after.OwnerId)
-
-		// Assign back to user without permissions to manage, using local mode
-		_, resp, err = th.LocalClient.AssignBot(bot.UserId, th.BasicUser.Id)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		after, resp, err = th.SystemAdminClient.GetBot(bot.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, th.BasicUser.Id, after.OwnerId)
-	})
-
-	t.Run("random user assign bot", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.SystemUserRoleId)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-		createdBot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(createdBot.UserId)
-
-		th.LoginBasic2()
-
-		// Without permission to read others bots it doesn't exist
-		_, _, err = th.Client.AssignBot(createdBot.UserId, th.BasicUser2.Id)
-		CheckErrorID(t, err, "store.sql_bot.get.missing.app_error")
-
-		// With permissions to read we don't have permissions to modify
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.SystemUserRoleId)
-		_, _, err = th.Client.AssignBot(createdBot.UserId, th.BasicUser2.Id)
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-
-		th.LoginBasic()
-	})
-
-	t.Run("delegated user assign bot", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.SystemUserRoleId)
-		th.App.UpdateConfig(func(cfg *model.Config) {
-			*cfg.ServiceSettings.EnableBotAccountCreation = true
-		})
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-		bot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(bot.UserId)
-
-		// Simulate custom role by just changing the system user role
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageOthersBots.Id, model.SystemUserRoleId)
-		th.LoginBasic2()
-
-		_, resp, err = th.Client.AssignBot(bot.UserId, th.BasicUser2.Id)
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-
-		after, resp, err := th.SystemAdminClient.GetBot(bot.UserId, "")
-		require.NoError(t, err)
-		CheckOKStatus(t, resp)
-		require.Equal(t, th.BasicUser2.Id, after.OwnerId)
-	})
-
-	t.Run("bot assigned to bot fails", func(t *testing.T) {
-		defer th.RestoreDefaultRolePermissions(th.SaveDefaultRolePermissions())
-
-		th.AddPermissionToRole(model.PermissionCreateBot.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadBots.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionReadOthersBots.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageBots.Id, model.SystemUserRoleId)
-		th.AddPermissionToRole(model.PermissionManageOthersBots.Id, model.SystemUserRoleId)
-
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
-		}
-		bot, resp, err := th.Client.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(bot.UserId)
-
-		bot2, resp, err := th.Client.CreateBot(&model.Bot{
-			Username:    GenerateTestUsername(),
-			DisplayName: "a bot",
-			Description: "bot",
-		})
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
-		defer th.App.PermanentDeleteBot(bot2.UserId)
-
-		_, _, err = th.Client.AssignBot(bot.UserId, bot2.UserId)
-		CheckErrorID(t, err, "api.context.permissions.app_error")
-
-	})
+	_, err = th.App.GetBot(bot.UserId, false)
+	require.NotNil(t, err)
+	require.Equal(t, "store.sql_bot.get.missing.app_error", err.Id)
 }
 
-func TestConvertBotToUser(t *testing.T) {
-	th := Setup(t).InitBasic()
+func TestDisableUserBots(t *testing.T) {
+	th := Setup(t)
 	defer th.TearDown()
 
-	th.AddPermissionToRole(model.PermissionCreateBot.Id, model.TeamUserRoleId)
-	th.App.UpdateUserRoles(th.Context, th.BasicUser.Id, model.TeamUserRoleId, false)
-	th.App.UpdateConfig(func(cfg *model.Config) {
-		*cfg.ServiceSettings.EnableBotAccountCreation = true
-	})
+	ownerId1 := model.NewId()
+	ownerId2 := model.NewId()
 
-	bot := &model.Bot{
-		Username:    GenerateTestUsername(),
-		Description: "bot",
+	bots := []*model.Bot{}
+	defer func() {
+		for _, bot := range bots {
+			th.App.PermanentDeleteBot(bot.UserId)
+		}
+	}()
+
+	for i := 0; i < 46; i++ {
+		bot, err := th.App.CreateBot(th.Context, &model.Bot{
+			Username:    fmt.Sprintf("username%v", i),
+			Description: "a bot",
+			OwnerId:     ownerId1,
+		})
+		require.Nil(t, err)
+		bots = append(bots, bot)
 	}
-	bot, resp, err := th.Client.CreateBot(bot)
-	require.NoError(t, err)
-	CheckCreatedStatus(t, resp)
-	defer th.App.PermanentDeleteBot(bot.UserId)
+	require.Len(t, bots, 46)
 
-	_, resp, err = th.Client.ConvertBotToUser(bot.UserId, &model.UserPatch{}, false)
-	require.Error(t, err)
-	CheckBadRequestStatus(t, resp)
+	u2bot1, err := th.App.CreateBot(th.Context, &model.Bot{
+		Username:    "username_nodisable",
+		Description: "a bot",
+		OwnerId:     ownerId2,
+	})
+	require.Nil(t, err)
+	defer th.App.PermanentDeleteBot(u2bot1.UserId)
 
-	user, resp, err := th.Client.ConvertBotToUser(bot.UserId, &model.UserPatch{Password: model.NewString("password")}, false)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
-	require.Nil(t, user)
+	err = th.App.disableUserBots(th.Context, ownerId1)
+	require.Nil(t, err)
 
-	th.TestForSystemAdminAndLocal(t, func(t *testing.T, client *model.Client4) {
-		bot := &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "bot",
+	// Check all bots and corresponding users are disabled for creator 1
+	for _, bot := range bots {
+		retbot, err2 := th.App.GetBot(bot.UserId, true)
+		require.Nil(t, err2)
+		require.NotZero(t, retbot.DeleteAt, bot.Username)
+	}
+
+	// Check bots and corresponding user not disabled for creator 2
+	bot, err := th.App.GetBot(u2bot1.UserId, true)
+	require.Nil(t, err)
+	require.Zero(t, bot.DeleteAt)
+
+	user, err := th.App.GetUser(u2bot1.UserId)
+	require.Nil(t, err)
+	require.Zero(t, user.DeleteAt)
+
+	// Bad id doesn't do anything or break horribly
+	err = th.App.disableUserBots(th.Context, model.NewId())
+	require.Nil(t, err)
+}
+
+func TestNotifySysadminsBotOwnerDisabled(t *testing.T) {
+	th := Setup(t)
+	defer th.TearDown()
+
+	userBots := []*model.Bot{}
+	defer func() {
+		for _, bot := range userBots {
+			th.App.PermanentDeleteBot(bot.UserId)
 		}
-		bot, resp, err := th.SystemAdminClient.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
+	}()
 
-		user, resp, err := client.ConvertBotToUser(bot.UserId, &model.UserPatch{}, false)
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-		require.Nil(t, user)
+	// // Create two sysadmins
+	sysadmin1 := model.User{
+		Email:    "sys1@example.com",
+		Nickname: "nn_sysadmin1",
+		Password: "hello1",
+		Username: "un_sysadmin1",
+		Roles:    model.SystemAdminRoleId + " " + model.SystemUserRoleId}
+	_, err := th.App.CreateUser(th.Context, &sysadmin1)
+	require.Nil(t, err, "failed to create user")
+	th.App.UpdateUserRoles(th.Context, sysadmin1.Id, model.SystemUserRoleId+" "+model.SystemAdminRoleId, false)
 
-		user, _, err = client.ConvertBotToUser(bot.UserId, &model.UserPatch{Password: model.NewString("password")}, false)
-		require.NoError(t, err)
-		require.NotNil(t, user)
-		require.Equal(t, bot.UserId, user.Id)
+	sysadmin2 := model.User{
+		Email:    "sys2@example.com",
+		Nickname: "nn_sysadmin2",
+		Password: "hello1",
+		Username: "un_sysadmin2",
+		Roles:    model.SystemAdminRoleId + " " + model.SystemUserRoleId}
+	_, err = th.App.CreateUser(th.Context, &sysadmin2)
+	require.Nil(t, err, "failed to create user")
+	th.App.UpdateUserRoles(th.Context, sysadmin2.Id, model.SystemUserRoleId+" "+model.SystemAdminRoleId, false)
 
-		_, resp, err = client.GetBot(bot.UserId, "")
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+	// create user to be disabled
+	user1, err := th.App.CreateUser(th.Context, &model.User{
+		Email:    "user1@example.com",
+		Username: "user1_disabled",
+		Nickname: "user1",
+		Password: "Password1",
+	})
+	require.Nil(t, err, "failed to create user")
 
-		bot = &model.Bot{
-			Username:    GenerateTestUsername(),
-			Description: "systemAdminBot",
-		}
-		bot, resp, err = th.SystemAdminClient.CreateBot(bot)
-		require.NoError(t, err)
-		CheckCreatedStatus(t, resp)
+	// create user that doesn't own any bots
+	user2, err := th.App.CreateUser(th.Context, &model.User{
+		Email:    "user2@example.com",
+		Username: "user2_disabled",
+		Nickname: "user2",
+		Password: "Password1",
+	})
+	require.Nil(t, err, "failed to create user")
 
-		user, _, err = client.ConvertBotToUser(bot.UserId, &model.UserPatch{Password: model.NewString("password")}, true)
-		require.NoError(t, err)
-		require.NotNil(t, user)
-		require.Equal(t, bot.UserId, user.Id)
-		require.Contains(t, user.GetRoles(), model.SystemAdminRoleId)
+	const numBotsToPrint = 10
 
-		_, resp, err = client.GetBot(bot.UserId, "")
-		require.Error(t, err)
-		CheckNotFoundStatus(t, resp)
+	// create bots owned by user (equal to numBotsToPrint)
+	var bot *model.Bot
+	for i := 0; i < numBotsToPrint; i++ {
+		bot, err = th.App.CreateBot(th.Context, &model.Bot{
+			Username:    fmt.Sprintf("bot%v", i),
+			Description: "a bot",
+			OwnerId:     user1.Id,
+		})
+		require.Nil(t, err)
+		userBots = append(userBots, bot)
+	}
+	assert.Len(t, userBots, 10)
+
+	// get DM channels for sysadmin1 and sysadmin2
+	channelSys1, appErr := th.App.GetOrCreateDirectChannel(th.Context, sysadmin1.Id, sysadmin1.Id)
+	require.Nil(t, appErr)
+	channelSys2, appErr := th.App.GetOrCreateDirectChannel(th.Context, sysadmin2.Id, sysadmin2.Id)
+	require.Nil(t, appErr)
+
+	// send notification for user without bots
+	err = th.App.notifySysadminsBotOwnerDeactivated(th.Context, user2.Id)
+	require.Nil(t, err)
+
+	// get posts from sysadmin1 and sysadmin2 DM channels
+	posts1, err := th.App.GetPosts(channelSys1.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Empty(t, posts1.Order)
+
+	posts2, err := th.App.GetPosts(channelSys2.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Empty(t, posts2.Order)
+
+	// send notification for user with bots
+	err = th.App.notifySysadminsBotOwnerDeactivated(th.Context, user1.Id)
+	require.Nil(t, err)
+
+	// get posts from sysadmin1  and sysadmin2 DM channels
+	posts1, err = th.App.GetPosts(channelSys1.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Len(t, posts1.Order, 1)
+
+	posts2, err = th.App.GetPosts(channelSys2.Id, 0, 5)
+	require.Nil(t, err)
+	assert.Len(t, posts2.Order, 1)
+
+	post := posts1.Posts[posts1.Order[0]].Message
+	assert.Equal(t, "user1_disabled was deactivated. They managed the following bot accounts which have now been disabled.\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nYou can take ownership of each bot by enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).", post)
+
+	// print all bots
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = true })
+	message := th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed the following bot accounts which have now been disabled.\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nYou can take ownership of each bot by enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).", message)
+
+	// print all bots
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = false })
+	message = th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed the following bot accounts which are still enabled.\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\n\nWe strongly recommend you to take ownership of each bot by re-enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).\n\nIf you want bot accounts to disable automatically after owner deactivation, set “Disable bot accounts when owner is deactivated” in **System Console > Integrations > Bot Accounts** to true.", message)
+
+	// create additional bot to go over the printable limit
+	for i := numBotsToPrint; i < numBotsToPrint+1; i++ {
+		bot, err = th.App.CreateBot(th.Context, &model.Bot{
+			Username:    fmt.Sprintf("bot%v", i),
+			Description: "a bot",
+			OwnerId:     user1.Id,
+		})
+		require.Nil(t, err)
+		userBots = append(userBots, bot)
+	}
+	assert.Len(t, userBots, 11)
+
+	// truncate number bots printed
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = true })
+	message = th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed 11 bot accounts which have now been disabled, including the following:\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nYou can take ownership of each bot by enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).", message)
+
+	// truncate number bots printed
+	th.App.UpdateConfig(func(cfg *model.Config) { *cfg.ServiceSettings.DisableBotsWhenOwnerIsDeactivated = false })
+	message = th.App.getDisableBotSysadminMessage(user1, userBots)
+	assert.Equal(t, "user1_disabled was deactivated. They managed 11 bot accounts which are still enabled, including the following:\n\n* bot0\n* bot1\n* bot2\n* bot3\n* bot4\n* bot5\n* bot6\n* bot7\n* bot8\n* bot9\nWe strongly recommend you to take ownership of each bot by re-enabling it at **Integrations > Bot Accounts** and creating new tokens for the bot.\n\nFor more information, see our [documentation](https://docs.mattermost.com/developer/bot-accounts.html#what-happens-when-a-user-who-owns-bot-accounts-is-disabled).\n\nIf you want bot accounts to disable automatically after owner deactivation, set “Disable bot accounts when owner is deactivated” in **System Console > Integrations > Bot Accounts** to true.", message)
+}
+
+func TestConvertUserToBot(t *testing.T) {
+	t.Run("invalid user", func(t *testing.T) {
+		t.Run("invalid user id", func(t *testing.T) {
+			th := Setup(t).InitBasic()
+			defer th.TearDown()
+
+			_, err := th.App.ConvertUserToBot(&model.User{
+				Username: "username",
+				Id:       "",
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.user_id.app_error", err.Id)
+		})
+
+		t.Run("invalid username", func(t *testing.T) {
+			th := Setup(t).InitBasic()
+			defer th.TearDown()
+
+			_, err := th.App.ConvertUserToBot(&model.User{
+				Username: "invalid username",
+				Id:       th.BasicUser.Id,
+			})
+			require.NotNil(t, err)
+			require.Equal(t, "model.bot.is_valid.username.app_error", err.Id)
+		})
+	})
+
+	t.Run("valid user", func(t *testing.T) {
+		th := Setup(t).InitBasic()
+		defer th.TearDown()
+
+		bot, err := th.App.ConvertUserToBot(&model.User{
+			Username: "username",
+			Id:       th.BasicUser.Id,
+		})
+		require.Nil(t, err)
+		defer th.App.PermanentDeleteBot(bot.UserId)
+		assert.Equal(t, "username", bot.Username)
+		assert.Equal(t, th.BasicUser.Id, bot.OwnerId)
+	})
+}
+
+func TestGetSystemBot(t *testing.T) {
+	t.Run("An error should be returned if there are no sysadmins in the instance", func(t *testing.T) {
+		th := Setup(t).InitBasic()
+		defer th.TearDown()
+
+		require.Nil(t, th.App.PermanentDeleteAllUsers(th.Context))
+
+		_, err := th.App.GetSystemBot()
+		require.NotNil(t, err)
+		require.Equal(t, "app.bot.get_system_bot.empty_admin_list.app_error", err.Id)
+	})
+
+	th := Setup(t).InitBasic()
+	defer th.TearDown()
+
+	t.Run("The bot should be created the first time it's retrieved", func(t *testing.T) {
+		// assert no bot with username exists
+		_, err := th.App.GetUserByUsername(model.BotSystemBotUsername)
+		require.NotNil(t, err)
+
+		bot, err := th.App.GetSystemBot()
+		require.Nil(t, err)
+		require.Equal(t, bot.Username, model.BotSystemBotUsername)
+	})
+
+	t.Run("The bot should be correctly retrieved if it exists already", func(t *testing.T) {
+		// assert that the bot is now present
+		botUser, err := th.App.GetUserByUsername(model.BotSystemBotUsername)
+		require.Nil(t, err)
+		require.True(t, botUser.IsBot)
+
+		bot, err := th.App.GetSystemBot()
+		require.Nil(t, err)
+		require.Equal(t, bot.Username, model.BotSystemBotUsername)
+		require.Equal(t, bot.UserId, botUser.Id)
 	})
 }
 

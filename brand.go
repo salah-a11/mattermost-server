@@ -1,97 +1,83 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"io"
+	"bytes"
+	"mime/multipart"
 	"net/http"
+	"time"
 
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
 )
 
-func (api *API) InitBrand() {
-	api.BaseRoutes.Brand.Handle("/image", api.APIHandlerTrustRequester(getBrandImage)).Methods("GET")
-	api.BaseRoutes.Brand.Handle("/image", api.APISessionRequired(uploadBrandImage)).Methods("POST")
-	api.BaseRoutes.Brand.Handle("/image", api.APISessionRequired(deleteBrandImage)).Methods("DELETE")
-}
+const (
+	BrandFilePath = "brand/"
+	BrandFileName = "image.png"
+)
 
-func getBrandImage(c *Context, w http.ResponseWriter, r *http.Request) {
-	// No permission check required
+func (a *App) SaveBrandImage(imageData *multipart.FileHeader) *model.AppError {
+	if *a.Config().FileSettings.DriverName == "" {
+		return model.NewAppError("SaveBrandImage", "api.admin.upload_brand_image.storage.app_error", nil, "", http.StatusNotImplemented)
+	}
 
-	img, err := c.App.GetBrandImage()
+	file, err := imageData.Open()
 	if err != nil {
-		w.WriteHeader(http.StatusNotFound)
-		w.Write(nil)
-		return
+		return model.NewAppError("SaveBrandImage", "brand.save_brand_image.open.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+	defer file.Close()
+
+	if err = checkImageLimits(file, *a.Config().FileSettings.MaxImageResolution); err != nil {
+		return model.NewAppError("SaveBrandImage", "brand.save_brand_image.check_image_limits.app_error", nil, "", http.StatusBadRequest).Wrap(err)
 	}
 
-	w.Header().Set("Content-Type", "image/png")
-	w.Write(img)
+	img, _, err := a.ch.imgDecoder.Decode(file)
+	if err != nil {
+		return model.NewAppError("SaveBrandImage", "brand.save_brand_image.decode.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	buf := new(bytes.Buffer)
+	err = a.ch.imgEncoder.EncodePNG(buf, img)
+	if err != nil {
+		return model.NewAppError("SaveBrandImage", "brand.save_brand_image.encode.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	t := time.Now()
+	a.MoveFile(BrandFilePath+BrandFileName, BrandFilePath+t.Format("2006-01-02T15:04:05")+".png")
+
+	if _, err := a.WriteFile(buf, BrandFilePath+BrandFileName); err != nil {
+		return model.NewAppError("SaveBrandImage", "brand.save_brand_image.save_image.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return nil
 }
 
-func uploadBrandImage(c *Context, w http.ResponseWriter, r *http.Request) {
-	defer io.Copy(io.Discard, r.Body)
-
-	if r.ContentLength > *c.App.Config().FileSettings.MaxFileSize {
-		c.Err = model.NewAppError("uploadBrandImage", "api.admin.upload_brand_image.too_large.app_error", nil, "", http.StatusRequestEntityTooLarge)
-		return
+func (a *App) GetBrandImage() ([]byte, *model.AppError) {
+	if *a.Config().FileSettings.DriverName == "" {
+		return nil, model.NewAppError("GetBrandImage", "api.admin.get_brand_image.storage.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	if err := r.ParseMultipartForm(*c.App.Config().FileSettings.MaxFileSize); err != nil {
-		c.Err = model.NewAppError("uploadBrandImage", "api.admin.upload_brand_image.parse.app_error", nil, "", http.StatusBadRequest)
-		return
+	img, err := a.ReadFile(BrandFilePath + BrandFileName)
+	if err != nil {
+		return nil, err
 	}
 
-	m := r.MultipartForm
-
-	imageArray, ok := m.File["image"]
-	if !ok {
-		c.Err = model.NewAppError("uploadBrandImage", "api.admin.upload_brand_image.no_file.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if len(imageArray) <= 0 {
-		c.Err = model.NewAppError("uploadBrandImage", "api.admin.upload_brand_image.array.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("uploadBrandImage", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionEditBrand) {
-		c.SetPermissionError(model.PermissionEditBrand)
-		return
-	}
-
-	if err := c.App.SaveBrandImage(imageArray[0]); err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	c.LogAudit("")
-
-	w.WriteHeader(http.StatusCreated)
-	ReturnStatusOK(w)
+	return img, nil
 }
 
-func deleteBrandImage(c *Context, w http.ResponseWriter, r *http.Request) {
-	auditRec := c.MakeAuditRecord("deleteBrandImage", audit.Fail)
-	defer c.LogAuditRec(auditRec)
+func (a *App) DeleteBrandImage() *model.AppError {
+	filePath := BrandFilePath + BrandFileName
 
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionEditBrand) {
-		c.SetPermissionError(model.PermissionEditBrand)
-		return
+	fileExists, err := a.FileExists(filePath)
+
+	if err != nil {
+		return err
 	}
 
-	if err := c.App.DeleteBrandImage(); err != nil {
-		c.Err = err
-		return
+	if !fileExists {
+		return model.NewAppError("DeleteBrandImage", "api.admin.delete_brand_image.storage.not_found", nil, "", http.StatusNotFound)
 	}
 
-	auditRec.Success()
-
-	ReturnStatusOK(w)
+	return a.RemoveFile(filePath)
 }

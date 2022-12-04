@@ -1,139 +1,225 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
+	"context"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/store/sqlstore"
 )
-
-func TestCreateJob(t *testing.T) {
-	th := Setup(t)
-	th.LoginSystemManager()
-	defer th.TearDown()
-
-	job := &model.Job{
-		Type: model.JobTypeActiveUsers,
-		Data: map[string]string{
-			"thing": "stuff",
-		},
-	}
-
-	t.Run("valid job as user without permissions", func(t *testing.T) {
-		_, resp, err := th.SystemManagerClient.CreateJob(job)
-		require.Error(t, err)
-		CheckForbiddenStatus(t, resp)
-	})
-
-	t.Run("valid job as user with permissions", func(t *testing.T) {
-		received, _, err := th.SystemAdminClient.CreateJob(job)
-		require.NoError(t, err)
-		defer th.App.Srv().Store().Job().Delete(received.Id)
-	})
-
-	t.Run("invalid job type as user without permissions", func(t *testing.T) {
-		_, resp, err := th.SystemAdminClient.CreateJob(&model.Job{Type: model.NewId()})
-		require.Error(t, err)
-		CheckBadRequestStatus(t, resp)
-	})
-}
 
 func TestGetJob(t *testing.T) {
 	th := Setup(t)
 	defer th.TearDown()
 
-	job := &model.Job{
+	status := &model.Job{
 		Id:     model.NewId(),
-		Status: model.JobStatusPending,
-		Type:   model.JobTypeMessageExport,
+		Status: model.NewId(),
 	}
-	_, err := th.App.Srv().Store().Job().Save(job)
+	_, err := th.App.Srv().Store().Job().Save(status)
 	require.NoError(t, err)
 
-	defer th.App.Srv().Store().Job().Delete(job.Id)
+	defer th.App.Srv().Store().Job().Delete(status.Id)
 
-	received, _, err := th.SystemAdminClient.GetJob(job.Id)
-	require.NoError(t, err)
-
-	require.Equal(t, job.Id, received.Id, "incorrect job received")
-	require.Equal(t, job.Status, received.Status, "incorrect job received")
-
-	_, resp, err := th.SystemAdminClient.GetJob("1234")
-	require.Error(t, err)
-	CheckBadRequestStatus(t, resp)
-
-	_, resp, err = th.Client.GetJob(job.Id)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
-
-	_, resp, err = th.SystemAdminClient.GetJob(model.NewId())
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
+	received, appErr := th.App.GetJob(status.Id)
+	require.Nil(t, appErr)
+	require.Equal(t, status, received, "incorrect job status received")
 }
 
-func TestGetJobs(t *testing.T) {
+func TestSessionHasPermissionToCreateJob(t *testing.T) {
 	th := Setup(t)
 	defer th.TearDown()
 
-	jobType := model.JobTypeDataRetention
-
-	t0 := model.GetMillis()
-	jobs := []*model.Job{
+	jobs := []model.Job{
 		{
 			Id:       model.NewId(),
-			Type:     jobType,
-			CreateAt: t0 + 1,
+			Type:     model.JobTypeBlevePostIndexing,
+			CreateAt: 1000,
 		},
 		{
 			Id:       model.NewId(),
-			Type:     jobType,
-			CreateAt: t0,
+			Type:     model.JobTypeDataRetention,
+			CreateAt: 999,
 		},
 		{
 			Id:       model.NewId(),
-			Type:     jobType,
-			CreateAt: t0 + 2,
+			Type:     model.JobTypeMessageExport,
+			CreateAt: 1001,
 		},
 	}
 
-	for _, job := range jobs {
-		_, err := th.App.Srv().Store().Job().Save(job)
-		require.NoError(t, err)
-		defer th.App.Srv().Store().Job().Delete(job.Id)
+	testCases := []struct {
+		Job                model.Job
+		PermissionRequired *model.Permission
+	}{
+		{
+			Job:                jobs[0],
+			PermissionRequired: model.PermissionCreatePostBleveIndexesJob,
+		},
+		{
+			Job:                jobs[1],
+			PermissionRequired: model.PermissionCreateDataRetentionJob,
+		},
+		{
+			Job:                jobs[2],
+			PermissionRequired: model.PermissionCreateComplianceExportJob,
+		},
 	}
 
-	received, _, err := th.SystemAdminClient.GetJobs(0, 2)
-	require.NoError(t, err)
+	session := model.Session{
+		Roles: model.SystemUserRoleId + " " + model.SystemAdminRoleId,
+	}
 
-	require.Len(t, received, 2, "received wrong number of jobs")
-	require.Equal(t, jobs[2].Id, received[0].Id, "should've received newest job first")
-	require.Equal(t, jobs[0].Id, received[1].Id, "should've received second newest job second")
+	// Check to see if admin has permission to all the jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToCreateJob(session, &testCase.Job)
+		assert.Equal(t, true, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
 
-	received, _, err = th.SystemAdminClient.GetJobs(1, 2)
-	require.NoError(t, err)
+	session = model.Session{
+		Roles: model.SystemUserRoleId + " " + model.SystemReadOnlyAdminRoleId,
+	}
 
-	require.Equal(t, jobs[1].Id, received[0].Id, "should've received oldest job last")
+	// Initially the system read only admin should not have access to create these jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToCreateJob(session, &testCase.Job)
+		assert.Equal(t, false, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
 
-	_, resp, err := th.Client.GetJobs(0, 60)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
+	ctx := sqlstore.WithMaster(context.Background())
+	role, _ := th.App.GetRoleByName(ctx, model.SystemReadOnlyAdminRoleId)
+
+	role.Permissions = append(role.Permissions, model.PermissionCreatePostBleveIndexesJob.Id)
+
+	_, err := th.App.UpdateRole(role)
+	require.Nil(t, err)
+
+	// Now system read only admin should have ability to create a Belve Post Index job but not the others
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToCreateJob(session, &testCase.Job)
+		expectedHasPermission := testCase.Job.Type == model.JobTypeBlevePostIndexing
+		assert.Equal(t, expectedHasPermission, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
+
+	role.Permissions = append(role.Permissions, model.PermissionCreateDataRetentionJob.Id)
+	role.Permissions = append(role.Permissions, model.PermissionCreateComplianceExportJob.Id)
+
+	_, err = th.App.UpdateRole(role)
+	require.Nil(t, err)
+
+	// Now system read only admin should have ability to create all jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToCreateJob(session, &testCase.Job)
+		assert.Equal(t, true, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
 }
 
-func TestGetJobsByType(t *testing.T) {
+func TestSessionHasPermissionToReadJob(t *testing.T) {
 	th := Setup(t)
-	th.LoginSystemManager()
 	defer th.TearDown()
 
-	jobType := model.JobTypeDataRetention
+	jobs := []model.Job{
+		{
+			Id:       model.NewId(),
+			Type:     model.JobTypeDataRetention,
+			CreateAt: 999,
+		},
+		{
+			Id:       model.NewId(),
+			Type:     model.JobTypeMessageExport,
+			CreateAt: 1001,
+		},
+	}
+	testCases := []struct {
+		Job                model.Job
+		PermissionRequired *model.Permission
+	}{
+		{
+			Job:                jobs[0],
+			PermissionRequired: model.PermissionReadDataRetentionJob,
+		},
+		{
+			Job:                jobs[1],
+			PermissionRequired: model.PermissionReadComplianceExportJob,
+		},
+	}
 
-	jobs := []*model.Job{
+	session := model.Session{
+		Roles: model.SystemUserRoleId + " " + model.SystemAdminRoleId,
+	}
+
+	// Check to see if admin has permission to all the jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToReadJob(session, testCase.Job.Type)
+		assert.Equal(t, true, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
+
+	session = model.Session{
+		Roles: model.SystemUserRoleId + " " + model.SystemManagerRoleId,
+	}
+
+	// Initially the system manager should not have access to read these jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToReadJob(session, testCase.Job.Type)
+		assert.Equal(t, false, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
+
+	ctx := sqlstore.WithMaster(context.Background())
+	role, _ := th.App.GetRoleByName(ctx, model.SystemManagerRoleId)
+
+	role.Permissions = append(role.Permissions, model.PermissionReadDataRetentionJob.Id)
+
+	_, err := th.App.UpdateRole(role)
+	require.Nil(t, err)
+
+	// Now system manager should have ability to read data retention jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToReadJob(session, testCase.Job.Type)
+		expectedHasPermission := testCase.Job.Type == model.JobTypeDataRetention
+		assert.Equal(t, expectedHasPermission, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
+
+	role.Permissions = append(role.Permissions, model.PermissionReadComplianceExportJob.Id)
+
+	_, err = th.App.UpdateRole(role)
+	require.Nil(t, err)
+
+	// Now system read only admin should have ability to create all jobs
+	for _, testCase := range testCases {
+		hasPermission, permissionRequired := th.App.SessionHasPermissionToReadJob(session, testCase.Job.Type)
+		assert.Equal(t, true, hasPermission)
+		require.NotNil(t, permissionRequired)
+		assert.Equal(t, testCase.PermissionRequired.Id, permissionRequired.Id)
+	}
+}
+
+func TestGetJobByType(t *testing.T) {
+	th := Setup(t)
+	defer th.TearDown()
+
+	jobType := model.NewId()
+
+	statuses := []*model.Job{
 		{
 			Id:       model.NewId(),
 			Type:     jobType,
@@ -149,189 +235,74 @@ func TestGetJobsByType(t *testing.T) {
 			Type:     jobType,
 			CreateAt: 1001,
 		},
-		{
-			Id:       model.NewId(),
-			Type:     model.NewId(),
-			CreateAt: 1002,
-		},
 	}
 
-	for _, job := range jobs {
-		_, err := th.App.Srv().Store().Job().Save(job)
+	for _, status := range statuses {
+		_, err := th.App.Srv().Store().Job().Save(status)
 		require.NoError(t, err)
-		defer th.App.Srv().Store().Job().Delete(job.Id)
+		defer th.App.Srv().Store().Job().Delete(status.Id)
 	}
 
-	received, _, err := th.SystemAdminClient.GetJobsByType(jobType, 0, 2)
-	require.NoError(t, err)
+	received, err := th.App.GetJobsByType(jobType, 0, 2)
+	require.Nil(t, err)
+	require.Len(t, received, 2, "received wrong number of statuses")
+	require.Equal(t, statuses[2], received[0], "should've received newest job first")
+	require.Equal(t, statuses[0], received[1], "should've received second newest job second")
 
-	require.Len(t, received, 2, "received wrong number of jobs")
-	require.Equal(t, jobs[2].Id, received[0].Id, "should've received newest job first")
-	require.Equal(t, jobs[0].Id, received[1].Id, "should've received second newest job second")
-
-	received, _, err = th.SystemAdminClient.GetJobsByType(jobType, 1, 2)
-	require.NoError(t, err)
-
-	require.Len(t, received, 1, "received wrong number of jobs")
-	require.Equal(t, jobs[1].Id, received[0].Id, "should've received oldest job last")
-
-	_, resp, err := th.SystemAdminClient.GetJobsByType("", 0, 60)
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
-
-	_, resp, err = th.SystemAdminClient.GetJobsByType(strings.Repeat("a", 33), 0, 60)
-	require.Error(t, err)
-	CheckBadRequestStatus(t, resp)
-
-	_, resp, err = th.Client.GetJobsByType(jobType, 0, 60)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
-
-	_, _, err = th.SystemManagerClient.GetJobsByType(model.JobTypeElasticsearchPostIndexing, 0, 60)
-	require.NoError(t, err)
+	received, err = th.App.GetJobsByType(jobType, 2, 2)
+	require.Nil(t, err)
+	require.Len(t, received, 1, "received wrong number of statuses")
+	require.Equal(t, statuses[1], received[0], "should've received oldest job last")
 }
 
-func TestDownloadJob(t *testing.T) {
-	th := Setup(t).InitBasic()
-	th.LoginSystemManager()
-	defer th.TearDown()
-	jobName := model.NewId()
-	job := &model.Job{
-		Id:   jobName,
-		Type: model.JobTypeMessageExport,
-		Data: map[string]string{
-			"export_type": "csv",
-		},
-		Status: model.JobStatusSuccess,
-	}
-
-	// DownloadExportResults is not set to true so we should get a not implemented error status
-	_, resp, err := th.Client.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckNotImplementedStatus(t, resp)
-
-	th.App.UpdateConfig(func(cfg *model.Config) {
-		*cfg.MessageExportSettings.DownloadExportResults = true
-	})
-
-	// Normal user cannot download the results of these job (non-existent job)
-	_, resp, err = th.Client.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
-
-	// System admin trying to download the results of a non-existent job
-	_, resp, err = th.SystemAdminClient.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
-
-	// Here we have a job that exist in our database but the results do not exist therefore when we try to download the results
-	// as a system admin, we should get a not found status.
-	_, err = th.App.Srv().Store().Job().Save(job)
-	require.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(job.Id)
-
-	filePath := "./data/export/" + job.Id + "/testdat.txt"
-	mkdirAllErr := os.MkdirAll(filepath.Dir(filePath), 0770)
-	require.NoError(t, mkdirAllErr)
-	os.Create(filePath)
-
-	// Normal user cannot download the results of these job (not the right permission)
-	_, resp, err = th.Client.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
-	th.SystemManagerClient.DownloadJob(job.Id)
-	// System manager with default permissions cannot download the results of these job (Doesn't have correct permissions)
-	_, resp, err = th.SystemManagerClient.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
-
-	_, resp, err = th.SystemAdminClient.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckBadRequestStatus(t, resp)
-
-	job.Data["is_downloadable"] = "true"
-	updateStatus, err := th.App.Srv().Store().Job().UpdateOptimistically(job, model.JobStatusSuccess)
-	require.True(t, updateStatus)
-	require.NoError(t, err)
-
-	_, resp, err = th.SystemAdminClient.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
-
-	// Now we stub the results of the job into the same directory and try to download it again
-	// This time we should successfully retrieve the results without any error
-	filePath = "./data/export/" + job.Id + ".zip"
-	mkdirAllErr = os.MkdirAll(filepath.Dir(filePath), 0770)
-	require.NoError(t, mkdirAllErr)
-	os.Create(filePath)
-
-	_, _, err = th.SystemAdminClient.DownloadJob(job.Id)
-	require.NoError(t, err)
-
-	// Here we are creating a new job which doesn't have type of message export
-	jobName = model.NewId()
-	job = &model.Job{
-		Id:   jobName,
-		Type: model.JobTypeCloud,
-		Data: map[string]string{
-			"export_type": "csv",
-		},
-		Status: model.JobStatusSuccess,
-	}
-	_, err = th.App.Srv().Store().Job().Save(job)
-	require.NoError(t, err)
-	defer th.App.Srv().Store().Job().Delete(job.Id)
-
-	// System admin shouldn't be able to download since the job type is not message export
-	_, resp, err = th.SystemAdminClient.DownloadJob(job.Id)
-	require.Error(t, err)
-	CheckBadRequestStatus(t, resp)
-}
-
-func TestCancelJob(t *testing.T) {
+func TestGetJobsByTypes(t *testing.T) {
 	th := Setup(t)
 	defer th.TearDown()
 
-	jobType := model.JobTypeMessageExport
-	jobs := []*model.Job{
+	jobType := model.NewId()
+	jobType1 := model.NewId()
+	jobType2 := model.NewId()
+
+	statuses := []*model.Job{
 		{
-			Id:     model.NewId(),
-			Type:   jobType,
-			Status: model.JobStatusPending,
+			Id:       model.NewId(),
+			Type:     jobType,
+			CreateAt: 1000,
 		},
 		{
-			Id:     model.NewId(),
-			Type:   jobType,
-			Status: model.JobStatusInProgress,
+			Id:       model.NewId(),
+			Type:     jobType1,
+			CreateAt: 999,
 		},
 		{
-			Id:     model.NewId(),
-			Type:   jobType,
-			Status: model.JobStatusSuccess,
+			Id:       model.NewId(),
+			Type:     jobType2,
+			CreateAt: 1001,
 		},
 	}
 
-	for _, job := range jobs {
-		_, err := th.App.Srv().Store().Job().Save(job)
+	for _, status := range statuses {
+		_, err := th.App.Srv().Store().Job().Save(status)
 		require.NoError(t, err)
-		defer th.App.Srv().Store().Job().Delete(job.Id)
+		defer th.App.Srv().Store().Job().Delete(status.Id)
 	}
 
-	resp, err := th.Client.CancelJob(jobs[0].Id)
-	require.Error(t, err)
-	CheckForbiddenStatus(t, resp)
+	jobTypes := []string{jobType, jobType1, jobType2}
+	received, err := th.App.GetJobsByTypes(jobTypes, 0, 2)
+	require.Nil(t, err)
+	require.Len(t, received, 2, "received wrong number of jobs")
+	require.Equal(t, statuses[2], received[0], "should've received newest job first")
+	require.Equal(t, statuses[0], received[1], "should've received second newest job second")
 
-	_, err = th.SystemAdminClient.CancelJob(jobs[0].Id)
-	require.NoError(t, err)
+	received, err = th.App.GetJobsByTypes(jobTypes, 2, 2)
+	require.Nil(t, err)
+	require.Len(t, received, 1, "received wrong number of jobs")
+	require.Equal(t, statuses[1], received[0], "should've received oldest job last")
 
-	_, err = th.SystemAdminClient.CancelJob(jobs[1].Id)
-	require.NoError(t, err)
-
-	resp, err = th.SystemAdminClient.CancelJob(jobs[2].Id)
-	require.Error(t, err)
-	CheckInternalErrorStatus(t, resp)
-
-	resp, err = th.SystemAdminClient.CancelJob(model.NewId())
-	require.Error(t, err)
-	CheckNotFoundStatus(t, resp)
+	jobTypes = []string{jobType1, jobType2}
+	received, err = th.App.GetJobsByTypes(jobTypes, 0, 3)
+	require.Nil(t, err)
+	require.Len(t, received, 2, "received wrong number of jobs")
+	require.Equal(t, statuses[2], received[0], "received wrong job type")
+	require.Equal(t, statuses[1], received[1], "received wrong job type")
 }

@@ -1,162 +1,83 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
-	"strconv"
+	"os"
 
-	"github.com/avct/uasurfer"
-
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
 	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitCompliance() {
-	api.BaseRoutes.Compliance.Handle("/reports", api.APISessionRequired(createComplianceReport)).Methods("POST")
-	api.BaseRoutes.Compliance.Handle("/reports", api.APISessionRequired(getComplianceReports)).Methods("GET")
-	api.BaseRoutes.Compliance.Handle("/reports/{report_id:[A-Za-z0-9]+}", api.APISessionRequired(getComplianceReport)).Methods("GET")
-	api.BaseRoutes.Compliance.Handle("/reports/{report_id:[A-Za-z0-9]+}/download", api.APISessionRequiredTrustRequester(downloadComplianceReport)).Methods("GET")
+func (a *App) GetComplianceReports(page, perPage int) (model.Compliances, *model.AppError) {
+	if license := a.Srv().License(); !*a.Config().ComplianceSettings.Enable || license == nil || !*license.Features.Compliance {
+		return nil, model.NewAppError("GetComplianceReports", "ent.compliance.licence_disable.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	compliances, err := a.Srv().Store().Compliance().GetAll(page*perPage, perPage)
+	if err != nil {
+		return nil, model.NewAppError("GetComplianceReports", "app.compliance.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return compliances, nil
 }
 
-func createComplianceReport(c *Context, w http.ResponseWriter, r *http.Request) {
-	var job model.Compliance
-	if jsonErr := json.NewDecoder(r.Body).Decode(&job); jsonErr != nil {
-		c.SetInvalidParamWithErr("compliance", jsonErr)
-		return
+func (a *App) SaveComplianceReport(job *model.Compliance) (*model.Compliance, *model.AppError) {
+	if license := a.Srv().License(); !*a.Config().ComplianceSettings.Enable || license == nil || !*license.Features.Compliance || a.Compliance() == nil {
+		return nil, model.NewAppError("saveComplianceReport", "ent.compliance.licence_disable.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	auditRec := c.MakeAuditRecord("createComplianceReport", audit.Fail)
-	auditRec.AddEventParameter("compliance", job)
-	defer c.LogAuditRec(auditRec)
+	job.Type = model.ComplianceTypeAdhoc
 
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionCreateComplianceExportJob) {
-		c.SetPermissionError(model.PermissionCreateComplianceExportJob)
-		return
-	}
-
-	job.UserId = c.AppContext.Session().UserId
-
-	rjob, err := c.App.SaveComplianceReport(&job)
+	job, err := a.Srv().Store().Compliance().Save(job)
 	if err != nil {
-		c.Err = err
-		return
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("SaveComplianceReport", "app.compliance.save.saving.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
 
-	auditRec.Success()
-	auditRec.AddEventResultState(rjob)
-	auditRec.AddEventObjectType("compliance")
-	auditRec.AddMeta("compliance_id", rjob.Id)
-	auditRec.AddMeta("compliance_desc", rjob.Desc)
-	c.LogAudit("")
+	jCopy := job.DeepCopy()
+	a.Srv().Go(func() {
+		err := a.Compliance().RunComplianceJob(jCopy)
+		if err != nil {
+			mlog.Warn("Error running compliance job", mlog.Err(err))
+		}
+	})
 
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(rjob); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return job, nil
 }
 
-func getComplianceReports(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionReadComplianceExportJob) {
-		c.SetPermissionError(model.PermissionReadComplianceExportJob)
-		return
+func (a *App) GetComplianceReport(reportId string) (*model.Compliance, *model.AppError) {
+	if license := a.Srv().License(); !*a.Config().ComplianceSettings.Enable || license == nil || !*license.Features.Compliance || a.Compliance() == nil {
+		return nil, model.NewAppError("downloadComplianceReport", "ent.compliance.licence_disable.app_error", nil, "", http.StatusNotImplemented)
 	}
 
-	auditRec := c.MakeAuditRecord("getComplianceReports", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	crs, err := c.App.GetComplianceReports(c.Params.Page, c.Params.PerPage)
+	compliance, err := a.Srv().Store().Compliance().Get(reportId)
 	if err != nil {
-		c.Err = err
-		return
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetComplianceReport", "app.compliance.get.finding.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetComplianceReport", "app.compliance.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
 
-	auditRec.Success()
-	if err := json.NewEncoder(w).Encode(crs); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return compliance, nil
 }
 
-func getComplianceReport(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireReportId()
-	if c.Err != nil {
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("getComplianceReport", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionReadComplianceExportJob) {
-		c.SetPermissionError(model.PermissionReadComplianceExportJob)
-		return
-	}
-
-	auditRec.AddEventParameter("report_id", c.Params.ReportId)
-	job, err := c.App.GetComplianceReport(c.Params.ReportId)
+func (a *App) GetComplianceFile(job *model.Compliance) ([]byte, *model.AppError) {
+	f, err := os.ReadFile(*a.Config().ComplianceSettings.Directory + "compliance/" + job.JobName() + ".zip")
 	if err != nil {
-		c.Err = err
-		return
+		return nil, model.NewAppError("readFile", "api.file.read_file.reading_local.app_error", nil, "", http.StatusNotImplemented).Wrap(err)
 	}
-
-	auditRec.Success()
-	auditRec.AddMeta("compliance_id", job.Id)
-	auditRec.AddMeta("compliance_desc", job.Desc)
-
-	if err := json.NewEncoder(w).Encode(job); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func downloadComplianceReport(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireReportId()
-	if c.Err != nil {
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("downloadComplianceReport", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("compliance_id", c.Params.ReportId)
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionDownloadComplianceExportResult) {
-		c.SetPermissionError(model.PermissionDownloadComplianceExportResult)
-		return
-	}
-
-	job, err := c.App.GetComplianceReport(c.Params.ReportId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddEventResultState(job)
-	auditRec.AddEventObjectType("compliance")
-
-	reportBytes, err := c.App.GetComplianceFile(job)
-	if err != nil {
-		c.Err = err
-		return
-	}
-	auditRec.AddMeta("length", len(reportBytes))
-
-	c.LogAudit("downloaded " + job.Desc)
-
-	w.Header().Set("Cache-Control", "max-age=2592000, private")
-	w.Header().Set("Content-Length", strconv.Itoa(len(reportBytes)))
-	w.Header().Del("Content-Type") // Content-Type will be set automatically by the http writer
-
-	// attach extra headers to trigger a download on IE, Edge, and Safari
-	ua := uasurfer.Parse(r.UserAgent())
-
-	w.Header().Set("Content-Disposition", "attachment;filename=\""+job.JobName()+".zip\"")
-
-	if ua.Browser.Name == uasurfer.BrowserIE || ua.Browser.Name == uasurfer.BrowserSafari {
-		// trim off anything before the final / so we just get the file's name
-		w.Header().Set("Content-Type", "application/octet-stream")
-	}
-
-	auditRec.Success()
-
-	w.Write(reportBytes)
+	return f, nil
 }

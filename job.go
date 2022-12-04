@@ -1,249 +1,136 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
+	"errors"
 	"net/http"
-	"path/filepath"
-	"strconv"
-	"time"
 
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
-	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitJob() {
-	api.BaseRoutes.Jobs.Handle("", api.APISessionRequired(getJobs)).Methods("GET")
-	api.BaseRoutes.Jobs.Handle("", api.APISessionRequired(createJob)).Methods("POST")
-	api.BaseRoutes.Jobs.Handle("/{job_id:[A-Za-z0-9]+}", api.APISessionRequired(getJob)).Methods("GET")
-	api.BaseRoutes.Jobs.Handle("/{job_id:[A-Za-z0-9]+}/download", api.APISessionRequiredTrustRequester(downloadJob)).Methods("GET")
-	api.BaseRoutes.Jobs.Handle("/{job_id:[A-Za-z0-9]+}/cancel", api.APISessionRequired(cancelJob)).Methods("POST")
-	api.BaseRoutes.Jobs.Handle("/type/{job_type:[A-Za-z0-9_-]+}", api.APISessionRequired(getJobsByType)).Methods("GET")
-}
-
-func getJob(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireJobId()
-	if c.Err != nil {
-		return
-	}
-
-	job, err := c.App.GetJob(c.Params.JobId)
+func (a *App) GetJob(id string) (*model.Job, *model.AppError) {
+	job, err := a.Srv().Store().Job().Get(id)
 	if err != nil {
-		c.Err = err
-		return
-	}
-
-	hasPermission, permissionRequired := c.App.SessionHasPermissionToReadJob(*c.AppContext.Session(), job.Type)
-	if permissionRequired == nil {
-		c.Err = model.NewAppError("getJob", "api.job.retrieve.nopermissions", nil, "", http.StatusBadRequest)
-		return
-	}
-	if !hasPermission {
-		c.SetPermissionError(permissionRequired)
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(job); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func downloadJob(c *Context, w http.ResponseWriter, r *http.Request) {
-	config := c.App.Config()
-	const FilePath = "export"
-	const FileMime = "application/zip"
-
-	c.RequireJobId()
-	if c.Err != nil {
-		return
-	}
-
-	if !*config.MessageExportSettings.DownloadExportResults {
-		c.Err = model.NewAppError("downloadExportResultsNotEnabled", "app.job.download_export_results_not_enabled", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	job, err := c.App.GetJob(c.Params.JobId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	// Currently, this endpoint only supports downloading the compliance report.
-	// If you need to download another job type, you will need to alter this section of the code to accommodate it.
-	if job.Type == model.JobTypeMessageExport && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionDownloadComplianceExportResult) {
-		c.SetPermissionError(model.PermissionDownloadComplianceExportResult)
-		return
-	} else if job.Type != model.JobTypeMessageExport {
-		c.Err = model.NewAppError("unableToDownloadJob", "api.job.unable_to_download_job.incorrect_job_type", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	isDownloadable, _ := strconv.ParseBool(job.Data["is_downloadable"])
-	if !isDownloadable {
-		c.Err = model.NewAppError("unableToDownloadJob", "api.job.unable_to_download_job", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	fileName := job.Id + ".zip"
-	filePath := filepath.Join(FilePath, fileName)
-	fileReader, err := c.App.FileReader(filePath)
-	if err != nil {
-		c.Err = err
-		c.Err.StatusCode = http.StatusNotFound
-		return
-	}
-	defer fileReader.Close()
-
-	// We are able to pass 0 for content size due to the fact that Golang's serveContent (https://golang.org/src/net/http/fs.go)
-	// already sets that for us
-	writeFileResponse(fileName, FileMime, 0, time.Unix(0, job.LastActivityAt*int64(1000*1000)), *c.App.Config().ServiceSettings.WebserverMode, fileReader, true, w, r)
-}
-
-func createJob(c *Context, w http.ResponseWriter, r *http.Request) {
-	var job model.Job
-	if jsonErr := json.NewDecoder(r.Body).Decode(&job); jsonErr != nil {
-		c.SetInvalidParamWithErr("job", jsonErr)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("createJob", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("job", job)
-
-	hasPermission, permissionRequired := c.App.SessionHasPermissionToCreateJob(*c.AppContext.Session(), &job)
-	if permissionRequired == nil {
-		c.Err = model.NewAppError("unableToCreateJob", "api.job.unable_to_create_job.incorrect_job_type", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if !hasPermission {
-		c.SetPermissionError(permissionRequired)
-		return
-	}
-
-	rjob, err := c.App.CreateJob(&job)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	auditRec.AddEventResultState(rjob)
-	auditRec.AddEventObjectType("job")
-
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(rjob); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func getJobs(c *Context, w http.ResponseWriter, r *http.Request) {
-	if c.Err != nil {
-		return
-	}
-
-	var validJobTypes []string
-	for _, jobType := range model.AllJobTypes {
-		hasPermission, permissionRequired := c.App.SessionHasPermissionToReadJob(*c.AppContext.Session(), jobType)
-		if permissionRequired == nil {
-			mlog.Warn("The job types of a job you are trying to retrieve does not contain permissions", mlog.String("jobType", jobType))
-			continue
-		}
-		if hasPermission {
-			validJobTypes = append(validJobTypes, jobType)
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetJob", "app.job.get.app_error", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetJob", "app.job.get.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
 	}
-	if len(validJobTypes) == 0 {
-		c.SetPermissionError()
-		return
-	}
 
-	jobs, appErr := c.App.GetJobsByTypesPage(validJobTypes, c.Params.Page, c.Params.PerPage)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(jobs)
-	if err != nil {
-		c.Err = model.NewAppError("getJobs", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-	w.Write(js)
+	return job, nil
 }
 
-func getJobsByType(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireJobType()
-	if c.Err != nil {
-		return
-	}
-
-	hasPermission, permissionRequired := c.App.SessionHasPermissionToReadJob(*c.AppContext.Session(), c.Params.JobType)
-	if permissionRequired == nil {
-		c.Err = model.NewAppError("getJobsByType", "api.job.retrieve.nopermissions", nil, "", http.StatusBadRequest)
-		return
-	}
-	if !hasPermission {
-		c.SetPermissionError(permissionRequired)
-		return
-	}
-
-	jobs, appErr := c.App.GetJobsByTypePage(c.Params.JobType, c.Params.Page, c.Params.PerPage)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	js, err := json.Marshal(jobs)
-	if err != nil {
-		c.Err = model.NewAppError("getJobsByType", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(js)
+func (a *App) GetJobsPage(page int, perPage int) ([]*model.Job, *model.AppError) {
+	return a.GetJobs(page*perPage, perPage)
 }
 
-func cancelJob(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireJobId()
-	if c.Err != nil {
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("cancelJob", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("job_id", c.Params.JobId)
-
-	job, err := c.App.GetJob(c.Params.JobId)
+func (a *App) GetJobs(offset int, limit int) ([]*model.Job, *model.AppError) {
+	jobs, err := a.Srv().Store().Job().GetAllPage(offset, limit)
 	if err != nil {
-		c.Err = err
-		return
+		return nil, model.NewAppError("GetJobs", "app.job.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	auditRec.AddEventPriorState(job)
-	auditRec.AddEventObjectType("job")
+	return jobs, nil
+}
 
-	// if permission to create, permission to cancel, same permission
-	hasPermission, permissionRequired := c.App.SessionHasPermissionToCreateJob(*c.AppContext.Session(), job)
-	if permissionRequired == nil {
-		c.Err = model.NewAppError("unableToCancelJob", "api.job.unable_to_create_job.incorrect_job_type", nil, "", http.StatusBadRequest)
-		return
+func (a *App) GetJobsByTypePage(jobType string, page int, perPage int) ([]*model.Job, *model.AppError) {
+	return a.GetJobsByType(jobType, page*perPage, perPage)
+}
+
+func (a *App) GetJobsByType(jobType string, offset int, limit int) ([]*model.Job, *model.AppError) {
+	jobs, err := a.Srv().Store().Job().GetAllByTypePage(jobType, offset, limit)
+	if err != nil {
+		return nil, model.NewAppError("GetJobsByType", "app.job.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if !hasPermission {
-		c.SetPermissionError(permissionRequired)
-		return
+	return jobs, nil
+}
+
+func (a *App) GetJobsByTypesPage(jobType []string, page int, perPage int) ([]*model.Job, *model.AppError) {
+	return a.GetJobsByTypes(jobType, page*perPage, perPage)
+}
+
+func (a *App) GetJobsByTypes(jobTypes []string, offset int, limit int) ([]*model.Job, *model.AppError) {
+	jobs, err := a.Srv().Store().Job().GetAllByTypesPage(jobTypes, offset, limit)
+	if err != nil {
+		return nil, model.NewAppError("GetJobsByType", "app.job.get_all.app_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return jobs, nil
+}
+
+func (a *App) CreateJob(job *model.Job) (*model.Job, *model.AppError) {
+	return a.Srv().Jobs.CreateJob(job.Type, job.Data)
+}
+
+func (a *App) CancelJob(jobId string) *model.AppError {
+	return a.Srv().Jobs.RequestCancellation(jobId)
+}
+
+func (a *App) SessionHasPermissionToCreateJob(session model.Session, job *model.Job) (bool, *model.Permission) {
+	switch job.Type {
+	case model.JobTypeBlevePostIndexing:
+		return a.SessionHasPermissionTo(session, model.PermissionCreatePostBleveIndexesJob), model.PermissionCreatePostBleveIndexesJob
+	case model.JobTypeDataRetention:
+		return a.SessionHasPermissionTo(session, model.PermissionCreateDataRetentionJob), model.PermissionCreateDataRetentionJob
+	case model.JobTypeMessageExport:
+		return a.SessionHasPermissionTo(session, model.PermissionCreateComplianceExportJob), model.PermissionCreateComplianceExportJob
+	case model.JobTypeElasticsearchPostIndexing:
+		return a.SessionHasPermissionTo(session, model.PermissionCreateElasticsearchPostIndexingJob), model.PermissionCreateElasticsearchPostIndexingJob
+	case model.JobTypeElasticsearchPostAggregation:
+		return a.SessionHasPermissionTo(session, model.PermissionCreateElasticsearchPostAggregationJob), model.PermissionCreateElasticsearchPostAggregationJob
+	case model.JobTypeLdapSync:
+		return a.SessionHasPermissionTo(session, model.PermissionCreateLdapSyncJob), model.PermissionCreateLdapSyncJob
+	case
+		model.JobTypeMigrations,
+		model.JobTypePlugins,
+		model.JobTypeProductNotices,
+		model.JobTypeExpiryNotify,
+		model.JobTypeActiveUsers,
+		model.JobTypeImportProcess,
+		model.JobTypeImportDelete,
+		model.JobTypeExportProcess,
+		model.JobTypeExportDelete,
+		model.JobTypeCloud,
+		model.JobTypeExtractContent:
+		return a.SessionHasPermissionTo(session, model.PermissionManageJobs), model.PermissionManageJobs
 	}
 
-	if err := c.App.CancelJob(c.Params.JobId); err != nil {
-		c.Err = err
-		return
+	return false, nil
+}
+
+func (a *App) SessionHasPermissionToReadJob(session model.Session, jobType string) (bool, *model.Permission) {
+	switch jobType {
+	case model.JobTypeDataRetention:
+		return a.SessionHasPermissionTo(session, model.PermissionReadDataRetentionJob), model.PermissionReadDataRetentionJob
+	case model.JobTypeMessageExport:
+		return a.SessionHasPermissionTo(session, model.PermissionReadComplianceExportJob), model.PermissionReadComplianceExportJob
+	case model.JobTypeElasticsearchPostIndexing:
+		return a.SessionHasPermissionTo(session, model.PermissionReadElasticsearchPostIndexingJob), model.PermissionReadElasticsearchPostIndexingJob
+	case model.JobTypeElasticsearchPostAggregation:
+		return a.SessionHasPermissionTo(session, model.PermissionReadElasticsearchPostAggregationJob), model.PermissionReadElasticsearchPostAggregationJob
+	case model.JobTypeLdapSync:
+		return a.SessionHasPermissionTo(session, model.PermissionReadLdapSyncJob), model.PermissionReadLdapSyncJob
+	case
+		model.JobTypeBlevePostIndexing,
+		model.JobTypeMigrations,
+		model.JobTypePlugins,
+		model.JobTypeProductNotices,
+		model.JobTypeExpiryNotify,
+		model.JobTypeActiveUsers,
+		model.JobTypeImportProcess,
+		model.JobTypeImportDelete,
+		model.JobTypeExportProcess,
+		model.JobTypeExportDelete,
+		model.JobTypeCloud,
+		model.JobTypeExtractContent:
+		return a.SessionHasPermissionTo(session, model.PermissionReadJobs), model.PermissionReadJobs
 	}
 
-	auditRec.Success()
-
-	ReturnStatusOK(w)
+	return false, nil
 }

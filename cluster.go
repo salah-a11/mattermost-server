@@ -1,35 +1,20 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
-import (
-	"encoding/json"
-	"net/http"
-
-	"github.com/mattermost/mattermost-server/v6/model"
-)
-
-func (api *API) InitCluster() {
-	api.BaseRoutes.Cluster.Handle("/status", api.APISessionRequired(getClusterStatus)).Methods("GET")
+// Registers a given function to be called when the cluster leader may have changed. Returns a unique ID for the
+// listener which can later be used to remove it. If clustering is not enabled in this build, the callback will never
+// be called.
+func (s *Server) AddClusterLeaderChangedListener(listener func()) string {
+	return s.platform.AddClusterLeaderChangedListener(listener)
 }
 
-func getClusterStatus(c *Context, w http.ResponseWriter, r *http.Request) {
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadEnvironmentHighAvailability) {
-		c.SetPermissionError(model.PermissionSysconsoleReadEnvironmentHighAvailability)
-		return
-	}
+// Removes a listener function by the unique ID returned when AddConfigListener was called
+func (s *Server) RemoveClusterLeaderChangedListener(id string) {
+	s.platform.RemoveClusterLeaderChangedListener(id)
+}
 
-	if *c.App.Config().ExperimentalSettings.RestrictSystemAdmin {
-		c.Err = model.NewAppError("getClusterStatus", "api.restricted_system_admin", nil, "", http.StatusForbidden)
-		return
-	}
-
-	infos := c.App.GetClusterStatus()
-	js, err := json.Marshal(infos)
-	if err != nil {
-		c.Err = model.NewAppError("getClusterStatus", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-	w.Write(js)
+func (s *Server) InvokeClusterLeaderChangedListeners() {
+	s.platform.InvokeClusterLeaderChangedListeners()
 }

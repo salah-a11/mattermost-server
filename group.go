@@ -1,1351 +1,806 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
-	"strconv"
-	"strings"
 
-	"github.com/mattermost/mattermost-server/v6/app"
-	"github.com/mattermost/mattermost-server/v6/audit"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitGroup() {
-	// GET /api/v4/groups
-	api.BaseRoutes.Groups.Handle("", api.APISessionRequired(getGroups)).Methods("GET")
-
-	// POST /api/v4/groups
-	api.BaseRoutes.Groups.Handle("", api.APISessionRequired(createGroup)).Methods("POST")
-
-	// GET /api/v4/groups/:group_id
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}",
-		api.APISessionRequired(getGroup)).Methods("GET")
-
-	// PUT /api/v4/groups/:group_id/patch
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/patch",
-		api.APISessionRequired(patchGroup)).Methods("PUT")
-
-	// POST /api/v4/groups/:group_id/teams/:team_id/link
-	// POST /api/v4/groups/:group_id/channels/:channel_id/link
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/{syncable_type:teams|channels}/{syncable_id:[A-Za-z0-9]+}/link",
-		api.APISessionRequired(linkGroupSyncable)).Methods("POST")
-
-	// DELETE /api/v4/groups/:group_id/teams/:team_id/link
-	// DELETE /api/v4/groups/:group_id/channels/:channel_id/link
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/{syncable_type:teams|channels}/{syncable_id:[A-Za-z0-9]+}/link",
-		api.APISessionRequired(unlinkGroupSyncable)).Methods("DELETE")
-
-	// GET /api/v4/groups/:group_id/teams/:team_id
-	// GET /api/v4/groups/:group_id/channels/:channel_id
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/{syncable_type:teams|channels}/{syncable_id:[A-Za-z0-9]+}",
-		api.APISessionRequired(getGroupSyncable)).Methods("GET")
-
-	// GET /api/v4/groups/:group_id/teams
-	// GET /api/v4/groups/:group_id/channels
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/{syncable_type:teams|channels}",
-		api.APISessionRequired(getGroupSyncables)).Methods("GET")
-
-	// PUT /api/v4/groups/:group_id/teams/:team_id/patch
-	// PUT /api/v4/groups/:group_id/channels/:channel_id/patch
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/{syncable_type:teams|channels}/{syncable_id:[A-Za-z0-9]+}/patch",
-		api.APISessionRequired(patchGroupSyncable)).Methods("PUT")
-
-	// GET /api/v4/groups/:group_id/stats
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/stats",
-		api.APISessionRequired(getGroupStats)).Methods("GET")
-
-	// GET /api/v4/groups/:group_id/members
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/members",
-		api.APISessionRequired(getGroupMembers)).Methods("GET")
-
-	// GET /api/v4/users/:user_id/groups
-	api.BaseRoutes.Users.Handle("/{user_id:[A-Za-z0-9]+}/groups",
-		api.APISessionRequired(getGroupsByUserId)).Methods("GET")
-
-	// GET /api/v4/channels/:channel_id/groups
-	api.BaseRoutes.Channels.Handle("/{channel_id:[A-Za-z0-9]+}/groups",
-		api.APISessionRequired(getGroupsByChannel)).Methods("GET")
-
-	// GET /api/v4/teams/:team_id/groups
-	api.BaseRoutes.Teams.Handle("/{team_id:[A-Za-z0-9]+}/groups",
-		api.APISessionRequired(getGroupsByTeam)).Methods("GET")
-
-	// GET /api/v4/teams/:team_id/groups_by_channels
-	api.BaseRoutes.Teams.Handle("/{team_id:[A-Za-z0-9]+}/groups_by_channels",
-		api.APISessionRequired(getGroupsAssociatedToChannelsByTeam)).Methods("GET")
-
-	// DELETE /api/v4/groups/:group_id
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}",
-		api.APISessionRequired(deleteGroup)).Methods("DELETE")
-
-	// GET /api/v4/groups/:group_id
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/restore",
-		api.APISessionRequired(restoreGroup)).Methods("POST")
-
-	// POST /api/v4/groups/:group_id/members
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/members",
-		api.APISessionRequired(addGroupMembers)).Methods("POST")
-
-	// DELETE /api/v4/groups/:group_id/members
-	api.BaseRoutes.Groups.Handle("/{group_id:[A-Za-z0-9]+}/members",
-		api.APISessionRequired(deleteGroupMembers)).Methods("DELETE")
-}
-
-func getGroup(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	restrictions, appErr := c.App.GetViewUsersRestrictions(c.AppContext.Session().UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	group, appErr := c.App.GetGroup(c.Params.GroupId, &model.GetGroupOpts{
-		IncludeMemberCount: c.Params.IncludeMemberCount,
-	}, restrictions)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if group.Source == model.GroupSourceLdap {
-		if !c.App.SessionHasPermissionToGroup(*c.AppContext.Session(), c.Params.GroupId, model.PermissionSysconsoleReadUserManagementGroups) {
-			c.SetPermissionError(model.PermissionSysconsoleReadUserManagementGroups)
-			return
+func (a *App) GetGroup(id string, opts *model.GetGroupOpts, viewRestrictions *model.ViewUsersRestrictions) (*model.Group, *model.AppError) {
+	group, err := a.Srv().Store().Group().Get(id)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetGroup", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetGroup", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
 	}
 
-	if appErr := licensedAndConfiguredForGroupBySource(c.App, group.Source); appErr != nil {
-		appErr.Where = "Api4.getGroup"
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(group)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroup", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(b)
-}
-
-func createGroup(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	var group *model.GroupWithUserIds
-	if err := json.NewDecoder(r.Body).Decode(&group); err != nil {
-		c.SetInvalidParamWithErr("group", err)
-		return
-	}
-
-	if group.Source != model.GroupSourceCustom {
-		c.Err = model.NewAppError("createGroup", "app.group.crud_permission", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if appErr := licensedAndConfiguredForGroupBySource(c.App, group.Source); appErr != nil {
-		appErr.Where = "Api4.createGroup"
-		c.Err = appErr
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionCreateCustomGroup) {
-		c.SetPermissionError(model.PermissionCreateCustomGroup)
-		return
-	}
-
-	if !group.AllowReference {
-		c.Err = model.NewAppError("createGroup", "api.custom_groups.must_be_referenceable", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if group.GetRemoteId() != "" {
-		c.Err = model.NewAppError("createGroup", "api.custom_groups.no_remote_id", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("createGroup", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("group", group)
-
-	newGroup, appErr := c.App.CreateGroupWithUserIds(group)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	auditRec.AddEventResultState(newGroup)
-	auditRec.AddEventObjectType("group")
-	js, err := json.Marshal(newGroup)
-	if err != nil {
-		c.Err = model.NewAppError("createGroup", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-	auditRec.Success()
-	w.WriteHeader(http.StatusCreated)
-	w.Write(js)
-}
-
-func patchGroup(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	group, appErr := c.App.GetGroup(c.Params.GroupId, nil, nil)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	appErr = licensedAndConfiguredForGroupBySource(c.App, group.Source)
-	if appErr != nil {
-		appErr.Where = "Api4.patchGroup"
-		c.Err = appErr
-		return
-	}
-
-	var requiredPermission *model.Permission
-	if group.Source == model.GroupSourceCustom {
-		requiredPermission = model.PermissionEditCustomGroup
-	} else {
-		requiredPermission = model.PermissionSysconsoleWriteUserManagementGroups
-	}
-	if !c.App.SessionHasPermissionToGroup(*c.AppContext.Session(), c.Params.GroupId, requiredPermission) {
-		c.SetPermissionError(requiredPermission)
-		return
-	}
-
-	var groupPatch model.GroupPatch
-	if err := json.NewDecoder(r.Body).Decode(&groupPatch); err != nil {
-		c.SetInvalidParamWithErr("group", err)
-		return
-	}
-
-	if group.Source == model.GroupSourceCustom && groupPatch.AllowReference != nil && !*groupPatch.AllowReference {
-		c.Err = model.NewAppError("Api4.patchGroup", "api.custom_groups.must_be_referenceable", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("patchGroup", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("group", group)
-
-	if groupPatch.AllowReference != nil && *groupPatch.AllowReference {
-		if groupPatch.Name == nil {
-			tmp := strings.ReplaceAll(strings.ToLower(group.DisplayName), " ", "-")
-			groupPatch.Name = &tmp
-		} else {
-			if *groupPatch.Name == model.UserNotifyAll || *groupPatch.Name == model.ChannelMentionsNotifyProp || *groupPatch.Name == model.UserNotifyHere {
-				c.Err = model.NewAppError("Api4.patchGroup", "api.ldap_groups.existing_reserved_name_error", nil, "", http.StatusBadRequest)
-				return
-			}
-			//check if a user already has this group name
-			user, _ := c.App.GetUserByUsername(*groupPatch.Name)
-			if user != nil {
-				c.Err = model.NewAppError("Api4.patchGroup", "api.ldap_groups.existing_user_name_error", nil, "", http.StatusBadRequest)
-				return
-			}
-			//check if a mentionable group already has this name
-			searchOpts := model.GroupSearchOpts{
-				FilterAllowReference: true,
-			}
-			existingGroup, _ := c.App.GetGroupByName(*groupPatch.Name, searchOpts)
-			if existingGroup != nil {
-				c.Err = model.NewAppError("Api4.patchGroup", "api.ldap_groups.existing_group_name_error", nil, "", http.StatusBadRequest)
-				return
-			}
-		}
-	}
-
-	group.Patch(&groupPatch)
-
-	group, appErr = c.App.UpdateGroup(group)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-	auditRec.AddEventResultState(group)
-	auditRec.AddEventObjectType("group")
-
-	b, err := json.Marshal(group)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.patchGroup", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	auditRec.Success()
-	w.Write(b)
-}
-
-func linkGroupSyncable(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	c.RequireSyncableId()
-	if c.Err != nil {
-		return
-	}
-	syncableID := c.Params.SyncableId
-
-	c.RequireSyncableType()
-	if c.Err != nil {
-		return
-	}
-	syncableType := c.Params.SyncableType
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.createGroupSyncable", "api.io_error", nil, "", http.StatusBadRequest).Wrap(err)
-		return
-	}
-
-	group, appErr := c.App.GetGroup(c.Params.GroupId, nil, nil)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if group.Source != model.GroupSourceLdap {
-		c.Err = model.NewAppError("Api4.linkGroupSyncable", "app.group.crud_permission", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("linkGroupSyncable", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("group_id", c.Params.GroupId)
-	auditRec.AddEventParameter("syncable_id", syncableID)
-	auditRec.AddEventParameter("syncable_type", syncableType)
-
-	var patch *model.GroupSyncablePatch
-	err = json.Unmarshal(body, &patch)
-	if err != nil || patch == nil {
-		c.SetInvalidParamWithErr(fmt.Sprintf("Group%s", syncableType), err)
-		return
-	}
-
-	auditRec.AddEventParameter("patch", patch)
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.createGroupSyncable", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	appErr = verifyLinkUnlinkPermission(c, syncableType, syncableID)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	groupSyncable := &model.GroupSyncable{
-		GroupId:    c.Params.GroupId,
-		SyncableId: syncableID,
-		Type:       syncableType,
-	}
-	groupSyncable.Patch(patch)
-	groupSyncable, appErr = c.App.UpsertGroupSyncable(groupSyncable)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	auditRec.AddEventResultState(groupSyncable)
-	auditRec.AddEventObjectType("group_syncable")
-
-	c.App.Srv().Go(func() {
-		c.App.SyncRolesAndMembership(c.AppContext, syncableID, syncableType, false)
-	})
-
-	w.WriteHeader(http.StatusCreated)
-
-	b, err := json.Marshal(groupSyncable)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.createGroupSyncable", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-	auditRec.Success()
-	w.Write(b)
-}
-
-func getGroupSyncable(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	c.RequireSyncableId()
-	if c.Err != nil {
-		return
-	}
-	syncableID := c.Params.SyncableId
-
-	c.RequireSyncableType()
-	if c.Err != nil {
-		return
-	}
-	syncableType := c.Params.SyncableType
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.getGroupSyncable", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionManageSystem) {
-		c.SetPermissionError(model.PermissionManageSystem)
-		return
-	}
-
-	groupSyncable, appErr := c.App.GetGroupSyncable(c.Params.GroupId, syncableID, syncableType)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(groupSyncable)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroupSyncable", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(b)
-}
-
-func getGroupSyncables(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	c.RequireSyncableType()
-	if c.Err != nil {
-		return
-	}
-	syncableType := c.Params.SyncableType
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.getGroupSyncables", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementGroups) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementGroups)
-		return
-	}
-
-	groupSyncables, appErr := c.App.GetGroupSyncables(c.Params.GroupId, syncableType)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(groupSyncables)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroupSyncables", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(b)
-}
-
-func patchGroupSyncable(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	c.RequireSyncableId()
-	if c.Err != nil {
-		return
-	}
-	syncableID := c.Params.SyncableId
-
-	c.RequireSyncableType()
-	if c.Err != nil {
-		return
-	}
-	syncableType := c.Params.SyncableType
-
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.patchGroupSyncable", "api.io_error", nil, "", http.StatusBadRequest).Wrap(err)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("patchGroupSyncable", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("group_id", c.Params.GroupId)
-	auditRec.AddEventParameter("old_syncable_id", syncableID)
-	auditRec.AddEventParameter("old_syncable_type", syncableType)
-
-	var patch *model.GroupSyncablePatch
-	err = json.Unmarshal(body, &patch)
-	if err != nil || patch == nil {
-		c.SetInvalidParamWithErr(fmt.Sprintf("Group[%s]Patch", syncableType), err)
-		return
-	}
-
-	auditRec.AddEventParameter("patch", patch)
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.patchGroupSyncable", "api.ldap_groups.license_error", nil, "",
-			http.StatusForbidden)
-		return
-	}
-
-	appErr := verifyLinkUnlinkPermission(c, syncableType, syncableID)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	groupSyncable, appErr := c.App.GetGroupSyncable(c.Params.GroupId, syncableID, syncableType)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	groupSyncable.Patch(patch)
-
-	groupSyncable, appErr = c.App.UpdateGroupSyncable(groupSyncable)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	auditRec.AddEventResultState(groupSyncable)
-	auditRec.AddEventObjectType("group_syncable")
-
-	c.App.Srv().Go(func() {
-		c.App.SyncRolesAndMembership(c.AppContext, syncableID, syncableType, false)
-	})
-
-	b, err := json.Marshal(groupSyncable)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.patchGroupSyncable", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-	auditRec.Success()
-	w.Write(b)
-}
-
-func unlinkGroupSyncable(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	c.RequireSyncableId()
-	if c.Err != nil {
-		return
-	}
-	syncableID := c.Params.SyncableId
-
-	c.RequireSyncableType()
-	if c.Err != nil {
-		return
-	}
-	syncableType := c.Params.SyncableType
-
-	auditRec := c.MakeAuditRecord("unlinkGroupSyncable", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("group_id", c.Params.GroupId)
-	auditRec.AddEventParameter("syncable_id", syncableID)
-	auditRec.AddEventParameter("syncable_type", syncableType)
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.unlinkGroupSyncable", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	appErr := verifyLinkUnlinkPermission(c, syncableType, syncableID)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	_, appErr = c.App.DeleteGroupSyncable(c.Params.GroupId, syncableID, syncableType)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	c.App.Srv().Go(func() {
-		c.App.SyncRolesAndMembership(c.AppContext, syncableID, syncableType, false)
-	})
-
-	auditRec.Success()
-
-	ReturnStatusOK(w)
-}
-
-func verifyLinkUnlinkPermission(c *Context, syncableType model.GroupSyncableType, syncableID string) *model.AppError {
-	switch syncableType {
-	case model.GroupSyncableTypeTeam:
-		if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), syncableID, model.PermissionManageTeam) {
-			return c.App.MakePermissionError(c.AppContext.Session(), []*model.Permission{model.PermissionManageTeam})
-		}
-	case model.GroupSyncableTypeChannel:
-		channel, err := c.App.GetChannel(c.AppContext, syncableID)
+	if opts != nil && opts.IncludeMemberCount {
+		memberCount, err := a.Srv().Store().Group().GetMemberCountWithRestrictions(id, viewRestrictions)
 		if err != nil {
-			return err
+			return nil, model.NewAppError("GetGroup", "app.member_count", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
+		group.MemberCount = model.NewInt(int(memberCount))
+	}
 
-		var permission *model.Permission
-		if channel.Type == model.ChannelTypePrivate {
-			permission = model.PermissionManagePrivateChannelMembers
-		} else {
-			permission = model.PermissionManagePublicChannelMembers
-		}
+	return group, nil
+}
 
-		if !c.App.SessionHasPermissionToChannel(c.AppContext, *c.AppContext.Session(), syncableID, permission) {
-			return c.App.MakePermissionError(c.AppContext.Session(), []*model.Permission{permission})
+func (a *App) GetGroupByName(name string, opts model.GroupSearchOpts) (*model.Group, *model.AppError) {
+	group, err := a.Srv().Store().Group().GetByName(name, opts)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetGroupByName", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetGroupByName", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
 	}
 
+	return group, nil
+}
+
+func (a *App) GetGroupByRemoteID(remoteID string, groupSource model.GroupSource) (*model.Group, *model.AppError) {
+	group, err := a.Srv().Store().Group().GetByRemoteID(remoteID, groupSource)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetGroupByRemoteID", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetGroupByRemoteID", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return group, nil
+}
+
+func (a *App) GetGroupsBySource(groupSource model.GroupSource) ([]*model.Group, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetAllBySource(groupSource)
+	if err != nil {
+		return nil, model.NewAppError("GetGroupsBySource", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groups, nil
+}
+
+func (a *App) GetGroupsByUserId(userID string) ([]*model.Group, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetByUser(userID)
+	if err != nil {
+		return nil, model.NewAppError("GetGroupsByUserId", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groups, nil
+}
+
+func (a *App) CreateGroup(group *model.Group) (*model.Group, *model.AppError) {
+	if err := a.isUniqueToUsernames(group.GetName()); err != nil {
+		err.Where = "CreateGroup"
+		return nil, err
+	}
+
+	group, err := a.Srv().Store().Group().Create(group)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("CreateGroup", "app.group.id.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("CreateGroup", "app.insert_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return group, nil
+}
+
+func (a *App) isUniqueToUsernames(val string) *model.AppError {
+	if val == "" {
+		return nil
+	}
+	var notFoundErr *store.ErrNotFound
+	user, err := a.Srv().Store().User().GetByUsername(val)
+	if err != nil && !errors.As(err, &notFoundErr) {
+		return model.NewAppError("isUniqueToUsernames", model.NoTranslation, nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	if user != nil {
+		return model.NewAppError("isUniqueToUsernames", model.NoTranslation, nil, fmt.Sprintf("user name %s exists", val), http.StatusBadRequest)
+	}
 	return nil
 }
 
-func getGroupMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	group, appErr := c.App.GetGroup(c.Params.GroupId, nil, nil)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	appErr = licensedAndConfiguredForGroupBySource(c.App, group.Source)
-	if appErr != nil {
-		appErr.Where = "Api4.getGroupMembers"
-		c.Err = appErr
-		return
-	}
-
-	if group.Source == model.GroupSourceLdap && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementGroups) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementGroups)
-		return
-	}
-
-	restrictions, appErr := c.App.GetViewUsersRestrictions(c.AppContext.Session().UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	members, count, appErr := c.App.GetGroupMemberUsersPage(c.Params.GroupId, c.Params.Page, c.Params.PerPage, restrictions)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(struct {
-		Members []*model.User `json:"members"`
-		Count   int           `json:"total_member_count"`
-	}{
-		Members: members,
-		Count:   count,
-	})
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroupMembers", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(b)
-}
-
-func getGroupStats(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.getGroupStats", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionSysconsoleReadUserManagementGroups) {
-		c.SetPermissionError(model.PermissionSysconsoleReadUserManagementGroups)
-		return
-	}
-
-	groupID := c.Params.GroupId
-	count, appErr := c.App.GetGroupMemberCount(groupID, nil)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(model.GroupStats{
-		GroupID:          groupID,
-		TotalMemberCount: count,
-	})
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroupStats", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(b)
-}
-
-func getGroupsByUserId(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireUserId()
-	if c.Err != nil {
-		return
-	}
-
-	if c.AppContext.Session().UserId != c.Params.UserId && !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionManageSystem) {
-		c.SetPermissionError(model.PermissionManageSystem)
-		return
-	}
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.getGroupsByUserId", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	groups, appErr := c.App.GetGroupsByUserId(c.Params.UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(groups)
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroupsByUserId", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
-	}
-
-	w.Write(b)
-}
-
-func getGroupsByChannel(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireChannelId()
-	if c.Err != nil {
-		return
-	}
-	b, appErr := getGroupsByChannelCommon(c, r)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-	w.Write(b)
-}
-
-func getGroupsByTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	b, appError := getGroupsByTeamCommon(c, r)
-	if appError != nil {
-		c.Err = appError
-		return
-	}
-	w.Write(b)
-}
-
-func getGroupsByTeamCommon(c *Context, r *http.Request) ([]byte, *model.AppError) {
-	if c.App.Channels().License() == nil || !*c.App.Channels().License().Features.LDAPGroups {
-		return nil, model.NewAppError("Api4.getGroupsByTeam", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-	}
-
-	opts := model.GroupSearchOpts{
-		Q:                    c.Params.Q,
-		IncludeMemberCount:   c.Params.IncludeMemberCount,
-		FilterAllowReference: c.Params.FilterAllowReference,
-	}
-	if c.Params.Paginate == nil || *c.Params.Paginate {
-		opts.PageOpts = &model.PageOpts{Page: c.Params.Page, PerPage: c.Params.PerPage}
-	}
-
-	groups, totalCount, appErr := c.App.GetGroupsByTeam(c.Params.TeamId, opts)
-	if appErr != nil {
+func (a *App) CreateGroupWithUserIds(group *model.GroupWithUserIds) (*model.Group, *model.AppError) {
+	if appErr := a.isUniqueToUsernames(group.GetName()); appErr != nil {
+		appErr.Where = "CreateGroupWithUserIds"
 		return nil, appErr
 	}
 
-	b, err := json.Marshal(struct {
-		Groups []*model.GroupWithSchemeAdmin `json:"groups"`
-		Count  int                           `json:"total_group_count"`
-	}{
-		Groups: groups,
-		Count:  totalCount,
-	})
-
+	newGroup, err := a.Srv().Store().Group().CreateWithUserIds(group)
 	if err != nil {
-		return nil, model.NewAppError("Api4.getGroupsByTeam", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		var dupKey *store.ErrUniqueConstraint
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("CreateGroupWithUserIds", "app.group.id.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+		case errors.As(err, &dupKey):
+			return nil, model.NewAppError("CreateGroupWithUserIds", "app.custom_group.unique_name", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("CreateGroupWithUserIds", "app.insert_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
 
-	return b, nil
+	messageWs := model.NewWebSocketEvent(model.WebsocketEventReceivedGroup, "", "", "", nil, "")
+	count, err := a.Srv().Store().Group().GetMemberCount(newGroup.Id)
+	if err != nil {
+		return nil, model.NewAppError("CreateGroupWithUserIds", "app.group.id.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+	group.MemberCount = model.NewInt(int(count))
+	groupJSON, jsonErr := json.Marshal(newGroup)
+	if jsonErr != nil {
+		return nil, model.NewAppError("CreateGroupWithUserIds", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(jsonErr)
+	}
+	messageWs.Add("group", string(groupJSON))
+	a.Publish(messageWs)
+
+	return newGroup, nil
 }
-func getGroupsByChannelCommon(c *Context, r *http.Request) ([]byte, *model.AppError) {
-	if c.App.Channels().License() == nil || !*c.App.Channels().License().Features.LDAPGroups {
-		return nil, model.NewAppError("Api4.getGroupsByChannel", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-	}
 
-	channel, appErr := c.App.GetChannel(c.AppContext, c.Params.ChannelId)
-	if appErr != nil {
+func (a *App) UpdateGroup(group *model.Group) (*model.Group, *model.AppError) {
+	if appErr := a.isUniqueToUsernames(group.GetName()); appErr != nil {
+		appErr.Where = "UpdateGroup"
 		return nil, appErr
 	}
 
-	var permission *model.Permission
-	if channel.Type == model.ChannelTypePrivate {
-		permission = model.PermissionReadPrivateChannelGroups
-	} else {
-		permission = model.PermissionReadPublicChannelGroups
-	}
-	if !c.App.SessionHasPermissionToChannel(c.AppContext, *c.AppContext.Session(), c.Params.ChannelId, permission) {
-		return nil, c.App.MakePermissionError(c.AppContext.Session(), []*model.Permission{permission})
-	}
-
-	opts := model.GroupSearchOpts{
-		Q:                    c.Params.Q,
-		IncludeMemberCount:   c.Params.IncludeMemberCount,
-		FilterAllowReference: c.Params.FilterAllowReference,
-	}
-	if c.Params.Paginate == nil || *c.Params.Paginate {
-		opts.PageOpts = &model.PageOpts{Page: c.Params.Page, PerPage: c.Params.PerPage}
+	updatedGroup, err := a.Srv().Store().Group().Update(group)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		var appErr *model.AppError
+		var dupKey *store.ErrUniqueConstraint
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("UpdateGroup", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &dupKey):
+			return nil, model.NewAppError("CreateGroup", "app.custom_group.unique_name", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("UpdateGroup", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
 
-	groups, totalCount, appErr := c.App.GetGroupsByChannel(c.Params.ChannelId, opts)
+	count, err := a.Srv().Store().Group().GetMemberCount(updatedGroup.Id)
+	if err != nil {
+		return nil, model.NewAppError("UpdateGroup", "app.group.id.app_error", nil, "", http.StatusBadRequest).Wrap(err)
+	}
+
+	updatedGroup.MemberCount = model.NewInt(int(count))
+	messageWs := model.NewWebSocketEvent(model.WebsocketEventReceivedGroup, "", "", "", nil, "")
+
+	groupJSON, err := json.Marshal(updatedGroup)
+	if err != nil {
+		return nil, model.NewAppError("UpdateGroup", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	messageWs.Add("group", string(groupJSON))
+	a.Publish(messageWs)
+
+	return updatedGroup, nil
+}
+
+func (a *App) DeleteGroup(groupID string) (*model.Group, *model.AppError) {
+	deletedGroup, err := a.Srv().Store().Group().Delete(groupID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("DeleteGroup", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("DeleteGroup", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return deletedGroup, nil
+}
+
+func (a *App) RestoreGroup(groupID string) (*model.Group, *model.AppError) {
+	restoredGroup, err := a.Srv().Store().Group().Restore(groupID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("RestoreGroup", "app.group.no_rows", nil, nfErr.Error(), http.StatusNotFound)
+		default:
+			return nil, model.NewAppError("RestoreGroup", "app.update_error", nil, err.Error(), http.StatusInternalServerError)
+		}
+	}
+
+	return restoredGroup, nil
+}
+
+func (a *App) GetGroupMemberCount(groupID string, viewRestrictions *model.ViewUsersRestrictions) (int64, *model.AppError) {
+	count, err := a.Srv().Store().Group().GetMemberCountWithRestrictions(groupID, viewRestrictions)
+	if err != nil {
+		return 0, model.NewAppError("GetGroupMemberCount", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return count, nil
+}
+
+func (a *App) GetGroupMemberUsers(groupID string) ([]*model.User, *model.AppError) {
+	users, err := a.Srv().Store().Group().GetMemberUsers(groupID)
+	if err != nil {
+		return nil, model.NewAppError("GetGroupMemberUsers", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return users, nil
+}
+
+func (a *App) GetGroupMemberUsersPage(groupID string, page int, perPage int, viewRestrictions *model.ViewUsersRestrictions) ([]*model.User, int, *model.AppError) {
+	members, err := a.Srv().Store().Group().GetMemberUsersPage(groupID, page, perPage, viewRestrictions)
+	if err != nil {
+		return nil, 0, model.NewAppError("GetGroupMemberUsersPage", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	count, appErr := a.GetGroupMemberCount(groupID, viewRestrictions)
 	if appErr != nil {
+		return nil, 0, appErr
+	}
+	return a.sanitizeProfiles(members, false), int(count), nil
+}
+
+func (a *App) GetUsersNotInGroupPage(groupID string, page int, perPage int, viewRestrictions *model.ViewUsersRestrictions) ([]*model.User, *model.AppError) {
+	members, err := a.Srv().Store().Group().GetNonMemberUsersPage(groupID, page, perPage, viewRestrictions)
+	if err != nil {
+		return nil, model.NewAppError("GetUsersNotInGroupPage", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return a.sanitizeProfiles(members, false), nil
+}
+
+func (a *App) UpsertGroupMember(groupID string, userID string) (*model.GroupMember, *model.AppError) {
+	groupMember, err := a.Srv().Store().Group().UpsertMember(groupID, userID)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("UpsertGroupMember", "app.group.uniqueness_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("UpsertGroupMember", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	if appErr := a.publishGroupMemberEvent(model.WebsocketEventGroupMemberAdd, groupMember); appErr != nil {
 		return nil, appErr
 	}
 
-	b, err := json.Marshal(struct {
-		Groups []*model.GroupWithSchemeAdmin `json:"groups"`
-		Count  int                           `json:"total_group_count"`
-	}{
-		Groups: groups,
-		Count:  totalCount,
-	})
-	if err != nil {
-		return nil, model.NewAppError("Api4.getGroupsByChannel", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-	}
-	return b, nil
+	return groupMember, nil
 }
 
-func getGroupsAssociatedToChannelsByTeam(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !*c.App.Channels().License().Features.LDAPGroups {
-		c.Err = model.NewAppError("Api4.getGroupsAssociatedToChannelsByTeam", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
-		return
-	}
-
-	opts := model.GroupSearchOpts{
-		Q:                    c.Params.Q,
-		IncludeMemberCount:   c.Params.IncludeMemberCount,
-		FilterAllowReference: c.Params.FilterAllowReference,
-	}
-	if c.Params.Paginate == nil || *c.Params.Paginate {
-		opts.PageOpts = &model.PageOpts{Page: c.Params.Page, PerPage: c.Params.PerPage}
-	}
-
-	groupsAssociatedByChannelID, appErr := c.App.GetGroupsAssociatedToChannelsByTeam(c.Params.TeamId, opts)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(struct {
-		GroupsAssociatedToChannels map[string][]*model.GroupWithSchemeAdmin `json:"groups"`
-	}{
-		GroupsAssociatedToChannels: groupsAssociatedByChannelID,
-	})
+func (a *App) DeleteGroupMember(groupID string, userID string) (*model.GroupMember, *model.AppError) {
+	groupMember, err := a.Srv().Store().Group().DeleteMember(groupID, userID)
 	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroupsAssociatedToChannelsByTeam", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("DeleteGroupMember", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("DeleteGroupMember", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
 
-	w.Write(b)
+	if appErr := a.publishGroupMemberEvent(model.WebsocketEventGroupMemberDelete, groupMember); appErr != nil {
+		return nil, appErr
+	}
+
+	return groupMember, nil
 }
 
-func getGroups(c *Context, w http.ResponseWriter, r *http.Request) {
-	var teamID, NotAssociatedToChannelID, ChannelIDForMemberCount string
-
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
+func (a *App) UpsertGroupSyncable(groupSyncable *model.GroupSyncable) (*model.GroupSyncable, *model.AppError) {
+	gs, err := a.Srv().Store().Group().GetGroupSyncable(groupSyncable.GroupId, groupSyncable.SyncableId, groupSyncable.Type)
+	var notFoundErr *store.ErrNotFound
+	if err != nil && !errors.As(err, &notFoundErr) {
+		return nil, model.NewAppError("UpsertGroupSyncable", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	source := c.Params.GroupSource
-
-	if id := c.Params.NotAssociatedToTeam; model.IsValidId(id) {
-		teamID = id
-	}
-
-	if id := c.Params.NotAssociatedToChannel; model.IsValidId(id) {
-		NotAssociatedToChannelID = id
-	}
-
-	if id := c.Params.IncludeChannelMemberCount; model.IsValidId(id) {
-		ChannelIDForMemberCount = id
-	}
-
-	// If they specify the group_source as custom when the feature is disabled, throw an error
-	if appErr := licensedAndConfiguredForGroupBySource(c.App, source); appErr != nil {
-		appErr.Where = "Api4.getGroups"
-		c.Err = appErr
-		return
-	}
-
-	// If they don't specify a source and custom groups are disabled, ensure they only get ldap groups in the response
-	if !*c.App.Config().ServiceSettings.EnableCustomGroups {
-		source = model.GroupSourceLdap
-	}
-
-	includeTimezones := r.URL.Query().Get("include_timezones") == "true"
-
-	opts := model.GroupSearchOpts{
-		Q:                         c.Params.Q,
-		IncludeMemberCount:        c.Params.IncludeMemberCount,
-		FilterAllowReference:      c.Params.FilterAllowReference,
-		FilterParentTeamPermitted: c.Params.FilterParentTeamPermitted,
-		Source:                    source,
-		FilterHasMember:           c.Params.FilterHasMember,
-		IncludeTimezones:          includeTimezones,
-	}
-
-	if teamID != "" {
-		_, appErr := c.App.GetTeam(teamID)
-		if appErr != nil {
-			c.Err = appErr
-			return
+	// reject the syncable creation if the group isn't already associated to the parent team
+	if groupSyncable.Type == model.GroupSyncableTypeChannel {
+		channel, nErr := a.Srv().Store().Channel().Get(groupSyncable.SyncableId, true)
+		if nErr != nil {
+			var nfErr *store.ErrNotFound
+			switch {
+			case errors.As(nErr, &nfErr):
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.channel.get.existing.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
+			default:
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.channel.get.find.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+			}
 		}
 
-		opts.NotAssociatedToTeam = teamID
-	}
-
-	if NotAssociatedToChannelID != "" {
-		channel, appErr := c.App.GetChannel(c.AppContext, NotAssociatedToChannelID)
-		if appErr != nil {
-			c.Err = appErr
-			return
+		var team *model.Team
+		team, nErr = a.Srv().Store().Team().Get(channel.TeamId)
+		if nErr != nil {
+			var nfErr *store.ErrNotFound
+			switch {
+			case errors.As(nErr, &nfErr):
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(nErr)
+			default:
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+			}
 		}
-		var permission *model.Permission
-		if channel.Type == model.ChannelTypePrivate {
-			permission = model.PermissionManagePrivateChannelMembers
+		if team.IsGroupConstrained() {
+			var teamGroups []*model.GroupWithSchemeAdmin
+			teamGroups, err = a.Srv().Store().Group().GetGroupsByTeam(channel.TeamId, model.GroupSearchOpts{})
+			if err != nil {
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+			var permittedGroup bool
+			for _, teamGroup := range teamGroups {
+				if teamGroup.Group.Id == groupSyncable.GroupId {
+					permittedGroup = true
+					break
+				}
+			}
+			if !permittedGroup {
+				return nil, model.NewAppError("UpsertGroupSyncable", "group_not_associated_to_synced_team", nil, "", http.StatusBadRequest)
+			}
 		} else {
-			permission = model.PermissionManagePublicChannelMembers
+			_, appErr := a.UpsertGroupSyncable(model.NewGroupTeam(groupSyncable.GroupId, team.Id, groupSyncable.AutoAdd))
+			if appErr != nil {
+				return nil, appErr
+			}
 		}
-		if !c.App.SessionHasPermissionToChannel(c.AppContext, *c.AppContext.Session(), NotAssociatedToChannelID, permission) {
-			c.SetPermissionError(permission)
-			return
-		}
-		opts.NotAssociatedToChannel = NotAssociatedToChannelID
 	}
 
-	if ChannelIDForMemberCount != "" {
-		channel, appErr := c.App.GetChannel(c.AppContext, ChannelIDForMemberCount)
-		if appErr != nil {
-			c.Err = appErr
-			return
-		}
-		var permission *model.Permission
-		if channel.Type == model.ChannelTypePrivate {
-			permission = model.PermissionManagePrivateChannelMembers
-		} else {
-			permission = model.PermissionManagePublicChannelMembers
-		}
-		if !c.App.SessionHasPermissionToChannel(c.AppContext, *c.AppContext.Session(), ChannelIDForMemberCount, permission) {
-			c.SetPermissionError(permission)
-			return
-		}
-		opts.IncludeChannelMemberCount = ChannelIDForMemberCount
-	}
-
-	sinceString := r.URL.Query().Get("since")
-	if sinceString != "" {
-		since, err := strconv.ParseInt(sinceString, 10, 64)
+	if gs == nil {
+		gs, err = a.Srv().Store().Group().CreateGroupSyncable(groupSyncable)
 		if err != nil {
-			c.SetInvalidParamWithErr("since", err)
-			return
+			var nfErr *store.ErrNotFound
+			var appErr *model.AppError
+			switch {
+			case errors.As(err, &appErr):
+				return nil, appErr
+			case errors.As(err, &nfErr):
+				return nil, model.NewAppError("UpsertGroupSyncable", "store.sql_channel.get.existing.app_error", nil, "", http.StatusNotFound).Wrap(err)
+			default:
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.insert_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
 		}
-		opts.Since = since
-	}
-
-	restrictions, appErr := c.App.GetViewUsersRestrictions(c.AppContext.Session().UserId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	var (
-		groups      = []*model.Group{}
-		canSee bool = true
-	)
-
-	if opts.FilterHasMember != "" {
-		canSee, appErr = c.App.UserCanSeeOtherUser(c.AppContext.Session().UserId, opts.FilterHasMember)
-		if appErr != nil {
-			c.Err = appErr
-			return
-		}
-	}
-
-	if canSee {
-		groups, appErr = c.App.GetGroups(c.Params.Page, c.Params.PerPage, opts, restrictions)
-		if appErr != nil {
-			c.Err = appErr
-			return
-		}
-	}
-
-	var (
-		b   []byte
-		err error
-	)
-	if c.Params.IncludeTotalCount {
-		totalCount, cerr := c.App.Srv().Store().Group().GroupCount()
-		if cerr != nil {
-			c.Err = model.NewAppError("Api4.getGroups", "api.custom_groups.count_err", nil, "", http.StatusInternalServerError).Wrap(cerr)
-			return
-		}
-		gwc := &model.GroupsWithCount{
-			Groups:     groups,
-			TotalCount: totalCount,
-		}
-		b, err = json.Marshal(gwc)
 	} else {
-		b, err = json.Marshal(groups)
+		gs, err = a.Srv().Store().Group().UpdateGroupSyncable(groupSyncable)
+		if err != nil {
+			var appErr *model.AppError
+			switch {
+			case errors.As(err, &appErr):
+				return nil, appErr
+			default:
+				return nil, model.NewAppError("UpsertGroupSyncable", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+		}
 	}
 
-	if err != nil {
-		c.Err = model.NewAppError("Api4.getGroups", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+	var messageWs *model.WebSocketEvent
+	if gs.Type == model.GroupSyncableTypeTeam {
+		messageWs = model.NewWebSocketEvent(model.WebsocketEventReceivedGroupAssociatedToTeam, gs.SyncableId, "", "", nil, "")
+	} else {
+		messageWs = model.NewWebSocketEvent(model.WebsocketEventReceivedGroupAssociatedToChannel, "", gs.SyncableId, "", nil, "")
 	}
+	messageWs.Add("group_id", gs.GroupId)
+	a.Publish(messageWs)
 
-	w.Write(b)
+	return gs, nil
 }
 
-func deleteGroup(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	group, err := c.App.GetGroup(c.Params.GroupId, nil, nil)
+func (a *App) GetGroupSyncable(groupID string, syncableID string, syncableType model.GroupSyncableType) (*model.GroupSyncable, *model.AppError) {
+	group, err := a.Srv().Store().Group().GetGroupSyncable(groupID, syncableID, syncableType)
 	if err != nil {
-		c.Err = err
-		return
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("GetGroupSyncable", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetGroupSyncable", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
 
-	if group.Source != model.GroupSourceCustom {
-		c.Err = model.NewAppError("Api4.deleteGroup", "app.group.crud_permission", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	if lcErr := licensedAndConfiguredForGroupBySource(c.App, model.GroupSourceCustom); lcErr != nil {
-		lcErr.Where = "Api4.deleteGroup"
-		c.Err = lcErr
-		return
-	}
-
-	if !c.App.SessionHasPermissionToGroup(*c.AppContext.Session(), c.Params.GroupId, model.PermissionDeleteCustomGroup) {
-		c.SetPermissionError(model.PermissionDeleteCustomGroup)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("deleteGroup", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("group_id", c.Params.GroupId)
-
-	_, err = c.App.DeleteGroup(c.Params.GroupId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-
-	ReturnStatusOK(w)
+	return group, nil
 }
 
-func restoreGroup(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	group, err := c.App.GetGroup(c.Params.GroupId, nil, nil)
+func (a *App) GetGroupSyncables(groupID string, syncableType model.GroupSyncableType) ([]*model.GroupSyncable, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetAllGroupSyncablesByGroupId(groupID, syncableType)
 	if err != nil {
-		c.Err = err
-		return
+		return nil, model.NewAppError("GetGroupSyncables", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if group.Source != model.GroupSourceCustom {
-		c.Err = model.NewAppError("Api4.restoreGroup", "app.group.crud_permission", nil, "", http.StatusNotImplemented)
-		return
-	}
-
-	if lcErr := licensedAndConfiguredForGroupBySource(c.App, model.GroupSourceCustom); lcErr != nil {
-		lcErr.Where = "Api4.restoreGroup"
-		c.Err = lcErr
-		return
-	}
-
-	if !c.App.SessionHasPermissionToGroup(*c.AppContext.Session(), c.Params.GroupId, model.PermissionDeleteCustomGroup) {
-		c.SetPermissionError(model.PermissionDeleteCustomGroup)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("restoreGroup", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddMeta("group_id", c.Params.GroupId)
-
-	_, err = c.App.RestoreGroup(c.Params.GroupId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-
-	ReturnStatusOK(w)
+	return groups, nil
 }
 
-func addGroupMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
+func (a *App) UpdateGroupSyncable(groupSyncable *model.GroupSyncable) (*model.GroupSyncable, *model.AppError) {
+	if groupSyncable.DeleteAt == 0 {
+		// updating a *deleted* GroupSyncable, so no need to ensure the GroupTeam is present (as done in the upsert)
+		gs, err := a.Srv().Store().Group().UpdateGroupSyncable(groupSyncable)
+		if err != nil {
+			var appErr *model.AppError
+			switch {
+			case errors.As(err, &appErr):
+				return nil, appErr
+			default:
+				return nil, model.NewAppError("UpdateGroupSyncable", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+			}
+		}
 
-	group, appErr := c.App.GetGroup(c.Params.GroupId, nil, nil)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if group.Source != model.GroupSourceCustom {
-		c.Err = model.NewAppError("Api4.deleteGroup", "app.group.crud_permission", nil, "", http.StatusBadRequest)
-		return
+		return gs, nil
 	}
 
-	appErr = licensedAndConfiguredForGroupBySource(c.App, model.GroupSourceCustom)
-	if appErr != nil {
-		appErr.Where = "Api4.deleteGroup"
-		c.Err = appErr
-		return
-	}
-
-	if !c.App.SessionHasPermissionToGroup(*c.AppContext.Session(), c.Params.GroupId, model.PermissionManageCustomGroupMembers) {
-		c.SetPermissionError(model.PermissionManageCustomGroupMembers)
-		return
-	}
-
-	var newMembers *model.GroupModifyMembers
-	if err := json.NewDecoder(r.Body).Decode(&newMembers); err != nil {
-		c.SetInvalidParamWithErr("addGroupMembers", err)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("addGroupMembers", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("addGroupMembers", newMembers)
-
-	members, appErr := c.App.UpsertGroupMembers(c.Params.GroupId, newMembers.UserIds)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(members)
+	// do an upsert to ensure that there's an associated GroupTeam
+	gs, err := a.UpsertGroupSyncable(groupSyncable)
 	if err != nil {
-		c.Err = model.NewAppError("Api4.addGroupMembers", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		return nil, err
 	}
-	auditRec.Success()
-	w.Write(b)
+
+	return gs, nil
 }
 
-func deleteGroupMembers(c *Context, w http.ResponseWriter, r *http.Request) {
-	permissionErr := requireLicense(c)
-	if permissionErr != nil {
-		c.Err = permissionErr
-		return
-	}
-	c.RequireGroupId()
-	if c.Err != nil {
-		return
-	}
-
-	group, appErr := c.App.GetGroup(c.Params.GroupId, nil, nil)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	if group.Source != model.GroupSourceCustom {
-		c.Err = model.NewAppError("Api4.deleteGroup", "app.group.crud_permission", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	appErr = licensedAndConfiguredForGroupBySource(c.App, model.GroupSourceCustom)
-	if appErr != nil {
-		appErr.Where = "Api4.deleteGroup"
-		c.Err = appErr
-		return
-	}
-
-	if !c.App.SessionHasPermissionToGroup(*c.AppContext.Session(), c.Params.GroupId, model.PermissionManageCustomGroupMembers) {
-		c.SetPermissionError(model.PermissionManageCustomGroupMembers)
-		return
-	}
-
-	var deleteBody *model.GroupModifyMembers
-	if err := json.NewDecoder(r.Body).Decode(&deleteBody); err != nil {
-		c.SetInvalidParamWithErr("deleteGroupMembers", err)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("deleteGroupMembers", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("deleteGroupMembers", deleteBody)
-
-	members, appErr := c.App.DeleteGroupMembers(c.Params.GroupId, deleteBody.UserIds)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-
-	b, err := json.Marshal(members)
+func (a *App) DeleteGroupSyncable(groupID string, syncableID string, syncableType model.GroupSyncableType) (*model.GroupSyncable, *model.AppError) {
+	gs, err := a.Srv().Store().Group().DeleteGroupSyncable(groupID, syncableID, syncableType)
 	if err != nil {
-		c.Err = model.NewAppError("Api4.addGroupMembers", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+		var invErr *store.ErrInvalidInput
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("DeleteGroupSyncable", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("DeleteGroupSyncable", "app.group.group_syncable_already_deleted", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("DeleteGroupSyncable", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
 	}
-	auditRec.Success()
-	w.Write(b)
+
+	// if a GroupTeam is being deleted delete all associated GroupChannels
+	if gs.Type == model.GroupSyncableTypeTeam {
+		allGroupChannels, err := a.Srv().Store().Group().GetAllGroupSyncablesByGroupId(gs.GroupId, model.GroupSyncableTypeChannel)
+		if err != nil {
+			return nil, model.NewAppError("DeleteGroupSyncable", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+
+		for _, groupChannel := range allGroupChannels {
+			_, err = a.Srv().Store().Group().DeleteGroupSyncable(groupChannel.GroupId, groupChannel.SyncableId, groupChannel.Type)
+			if err != nil {
+				var invErr *store.ErrInvalidInput
+				var nfErr *store.ErrNotFound
+				switch {
+				case errors.As(err, &nfErr):
+					return nil, model.NewAppError("DeleteGroupSyncable", "app.group.no_rows", nil, "", http.StatusNotFound).Wrap(err)
+				case errors.As(err, &invErr):
+					return nil, model.NewAppError("DeleteGroupSyncable", "app.group.group_syncable_already_deleted", nil, "", http.StatusBadRequest).Wrap(err)
+				default:
+					return nil, model.NewAppError("DeleteGroupSyncable", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+				}
+			}
+		}
+	}
+
+	var messageWs *model.WebSocketEvent
+	if gs.Type == model.GroupSyncableTypeTeam {
+		messageWs = model.NewWebSocketEvent(model.WebsocketEventReceivedGroupNotAssociatedToTeam, gs.SyncableId, "", "", nil, "")
+	} else {
+		messageWs = model.NewWebSocketEvent(model.WebsocketEventReceivedGroupNotAssociatedToChannel, "", gs.SyncableId, "", nil, "")
+	}
+
+	messageWs.Add("group_id", gs.GroupId)
+	a.Publish(messageWs)
+
+	return gs, nil
 }
 
-// licensedAndConfiguredForGroupBySource returns an app error if not properly license or configured for the given group type. The returned app error
-// will have a blank 'Where' field, which should be subsequently set by the caller, for example:
+// TeamMembersToAdd returns a slice of UserTeamIDPair that need newly created memberships
+// based on the groups configurations. The returned list can be optionally scoped to a single given team.
 //
-//	err := licensedAndConfiguredForGroupBySource(c.App, group.Source)
-//	err.Where = "Api4.getGroup"
-func licensedAndConfiguredForGroupBySource(app app.AppIface, source model.GroupSource) *model.AppError {
-	lic := app.Srv().License()
-
-	if lic == nil {
-		return model.NewAppError("", "api.license_error", nil, "", http.StatusForbidden)
+// Typically since will be the last successful group sync time.
+// If includeRemovedMembers is true, then team members who left or were removed from the team will
+// be included; otherwise, they will be excluded.
+func (a *App) TeamMembersToAdd(since int64, teamID *string, includeRemovedMembers bool) ([]*model.UserTeamIDPair, *model.AppError) {
+	userTeams, err := a.Srv().Store().Group().TeamMembersToAdd(since, teamID, includeRemovedMembers)
+	if err != nil {
+		return nil, model.NewAppError("TeamMembersToAdd", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if source == model.GroupSourceLdap && !*lic.Features.LDAPGroups {
-		return model.NewAppError("", "api.ldap_groups.license_error", nil, "", http.StatusForbidden)
+	return userTeams, nil
+}
+
+// ChannelMembersToAdd returns a slice of UserChannelIDPair that need newly created memberships
+// based on the groups configurations. The returned list can be optionally scoped to a single given channel.
+//
+// Typically since will be the last successful group sync time.
+// If includeRemovedMembers is true, then channel members who left or were removed from the channel will
+// be included; otherwise, they will be excluded.
+func (a *App) ChannelMembersToAdd(since int64, channelID *string, includeRemovedMembers bool) ([]*model.UserChannelIDPair, *model.AppError) {
+	userChannels, err := a.Srv().Store().Group().ChannelMembersToAdd(since, channelID, includeRemovedMembers)
+	if err != nil {
+		return nil, model.NewAppError("ChannelMembersToAdd", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if source == model.GroupSourceCustom && lic.SkuShortName != model.LicenseShortSkuProfessional && lic.SkuShortName != model.LicenseShortSkuEnterprise {
-		return model.NewAppError("", "api.custom_groups.license_error", nil, "", http.StatusBadRequest)
+	return userChannels, nil
+}
+
+func (a *App) TeamMembersToRemove(teamID *string) ([]*model.TeamMember, *model.AppError) {
+	teamMembers, err := a.Srv().Store().Group().TeamMembersToRemove(teamID)
+	if err != nil {
+		return nil, model.NewAppError("TeamMembersToRemove", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if source == model.GroupSourceCustom && !*app.Config().ServiceSettings.EnableCustomGroups {
-		return model.NewAppError("", "api.custom_groups.feature_disabled", nil, "", http.StatusBadRequest)
+	return teamMembers, nil
+}
+
+func (a *App) ChannelMembersToRemove(teamID *string) ([]*model.ChannelMember, *model.AppError) {
+	channelMembers, err := a.Srv().Store().Group().ChannelMembersToRemove(teamID)
+	if err != nil {
+		return nil, model.NewAppError("ChannelMembersToRemove", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
+	return channelMembers, nil
+}
+
+func (a *App) GetGroupsByChannel(channelID string, opts model.GroupSearchOpts) ([]*model.GroupWithSchemeAdmin, int, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetGroupsByChannel(channelID, opts)
+	if err != nil {
+		return nil, 0, model.NewAppError("GetGroupsByChannel", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	count, err := a.Srv().Store().Group().CountGroupsByChannel(channelID, opts)
+	if err != nil {
+		return nil, 0, model.NewAppError("GetGroupsByChannel", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groups, int(count), nil
+}
+
+// GetGroupsByTeam returns the paged list and the total count of group associated to the given team.
+func (a *App) GetGroupsByTeam(teamID string, opts model.GroupSearchOpts) ([]*model.GroupWithSchemeAdmin, int, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetGroupsByTeam(teamID, opts)
+	if err != nil {
+		return nil, 0, model.NewAppError("GetGroupsByTeam", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	count, err := a.Srv().Store().Group().CountGroupsByTeam(teamID, opts)
+	if err != nil {
+		return nil, 0, model.NewAppError("GetGroupsByTeam", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groups, int(count), nil
+}
+
+func (a *App) GetGroupsAssociatedToChannelsByTeam(teamID string, opts model.GroupSearchOpts) (map[string][]*model.GroupWithSchemeAdmin, *model.AppError) {
+	groupsAssociatedByChannelId, err := a.Srv().Store().Group().GetGroupsAssociatedToChannelsByTeam(teamID, opts)
+	if err != nil {
+		return nil, model.NewAppError("GetGroupsAssociatedToChannelsByTeam", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groupsAssociatedByChannelId, nil
+}
+
+func (a *App) GetGroups(page, perPage int, opts model.GroupSearchOpts, viewRestrictions *model.ViewUsersRestrictions) ([]*model.Group, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetGroups(page, perPage, opts, viewRestrictions)
+	if err != nil {
+		return nil, model.NewAppError("GetGroups", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groups, nil
+}
+
+// TeamMembersMinusGroupMembers returns the set of users on the given team minus the set of users in the given
+// groups.
+//
+// The result can be used, for example, to determine the set of users who would be removed from a team if the team
+// were group-constrained with the given groups.
+func (a *App) TeamMembersMinusGroupMembers(teamID string, groupIDs []string, page, perPage int) ([]*model.UserWithGroups, int64, *model.AppError) {
+	users, err := a.Srv().Store().Group().TeamMembersMinusGroupMembers(teamID, groupIDs, page, perPage)
+	if err != nil {
+		return nil, 0, model.NewAppError("TeamMembersMinusGroupMembers", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, u := range users {
+		a.SanitizeProfile(&u.User, false)
+	}
+
+	// parse all group ids of all users
+	allUsersGroupIDMap := map[string]bool{}
+	for _, user := range users {
+		for _, groupID := range user.GetGroupIDs() {
+			allUsersGroupIDMap[groupID] = true
+		}
+	}
+
+	// create a slice of distinct group ids
+	var allUsersGroupIDSlice []string
+	for key := range allUsersGroupIDMap {
+		allUsersGroupIDSlice = append(allUsersGroupIDSlice, key)
+	}
+
+	// retrieve groups from DB
+	groups, appErr := a.GetGroupsByIDs(allUsersGroupIDSlice)
+	if appErr != nil {
+		return nil, 0, appErr
+	}
+
+	// map groups by id
+	groupMap := map[string]*model.Group{}
+	for _, group := range groups {
+		groupMap[group.Id] = group
+	}
+
+	// populate each instance's groups field
+	for _, user := range users {
+		user.Groups = []*model.Group{}
+		for _, groupID := range user.GetGroupIDs() {
+			group, ok := groupMap[groupID]
+			if ok {
+				user.Groups = append(user.Groups, group)
+			}
+		}
+	}
+
+	totalCount, err := a.Srv().Store().Group().CountTeamMembersMinusGroupMembers(teamID, groupIDs)
+	if err != nil {
+		return nil, 0, model.NewAppError("TeamMembersMinusGroupMembers", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return users, totalCount, nil
+}
+
+func (a *App) GetGroupsByIDs(groupIDs []string) ([]*model.Group, *model.AppError) {
+	groups, err := a.Srv().Store().Group().GetByIDs(groupIDs)
+	if err != nil {
+		return nil, model.NewAppError("GetGroupsByIDs", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return groups, nil
+}
+
+// ChannelMembersMinusGroupMembers returns the set of users in the given channel minus the set of users in the given
+// groups.
+//
+// The result can be used, for example, to determine the set of users who would be removed from a channel if the
+// channel were group-constrained with the given groups.
+func (a *App) ChannelMembersMinusGroupMembers(channelID string, groupIDs []string, page, perPage int) ([]*model.UserWithGroups, int64, *model.AppError) {
+	users, err := a.Srv().Store().Group().ChannelMembersMinusGroupMembers(channelID, groupIDs, page, perPage)
+	if err != nil {
+		return nil, 0, model.NewAppError("ChannelMembersMinusGroupMembers", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, u := range users {
+		a.SanitizeProfile(&u.User, false)
+	}
+
+	// parse all group ids of all users
+	allUsersGroupIDMap := map[string]bool{}
+	for _, user := range users {
+		for _, groupID := range user.GetGroupIDs() {
+			allUsersGroupIDMap[groupID] = true
+		}
+	}
+
+	// create a slice of distinct group ids
+	var allUsersGroupIDSlice []string
+	for key := range allUsersGroupIDMap {
+		allUsersGroupIDSlice = append(allUsersGroupIDSlice, key)
+	}
+
+	// retrieve groups from DB
+	groups, appErr := a.GetGroupsByIDs(allUsersGroupIDSlice)
+	if appErr != nil {
+		return nil, 0, appErr
+	}
+
+	// map groups by id
+	groupMap := map[string]*model.Group{}
+	for _, group := range groups {
+		groupMap[group.Id] = group
+	}
+
+	// populate each instance's groups field
+	for _, user := range users {
+		user.Groups = []*model.Group{}
+		for _, groupID := range user.GetGroupIDs() {
+			group, ok := groupMap[groupID]
+			if ok {
+				user.Groups = append(user.Groups, group)
+			}
+		}
+	}
+
+	totalCount, err := a.Srv().Store().Group().CountChannelMembersMinusGroupMembers(channelID, groupIDs)
+	if err != nil {
+		return nil, 0, model.NewAppError("ChannelMembersMinusGroupMembers", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+	return users, totalCount, nil
+}
+
+// UserIsInAdminRoleGroup returns true at least one of the user's groups are configured to set the members as
+// admins in the given syncable.
+func (a *App) UserIsInAdminRoleGroup(userID, syncableID string, syncableType model.GroupSyncableType) (bool, *model.AppError) {
+	groupIDs, err := a.Srv().Store().Group().AdminRoleGroupsForSyncableMember(userID, syncableID, syncableType)
+	if err != nil {
+		return false, model.NewAppError("UserIsInAdminRoleGroup", "app.select_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	if len(groupIDs) == 0 {
+		return false, nil
+	}
+
+	return true, nil
+}
+
+func (a *App) UpsertGroupMembers(groupID string, userIDs []string) ([]*model.GroupMember, *model.AppError) {
+	members, err := a.Srv().Store().Group().UpsertMembers(groupID, userIDs)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("UpsertGroupMembers", "app.group.uniqueness_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("UpsertGroupMembers", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	for _, groupMember := range members {
+		if appErr := a.publishGroupMemberEvent(model.WebsocketEventGroupMemberAdd, groupMember); appErr != nil {
+			return nil, appErr
+		}
+	}
+
+	return members, nil
+}
+
+func (a *App) DeleteGroupMembers(groupID string, userIDs []string) ([]*model.GroupMember, *model.AppError) {
+	members, err := a.Srv().Store().Group().DeleteMembers(groupID, userIDs)
+	if err != nil {
+		var invErr *store.ErrInvalidInput
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &appErr):
+			return nil, appErr
+		case errors.As(err, &invErr):
+			return nil, model.NewAppError("DeleteGroupMember", "app.group.uniqueness_error", nil, "", http.StatusBadRequest).Wrap(err)
+		default:
+			return nil, model.NewAppError("DeleteGroupMember", "app.update_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	for _, groupMember := range members {
+		if appErr := a.publishGroupMemberEvent(model.WebsocketEventGroupMemberDelete, groupMember); appErr != nil {
+			return nil, appErr
+		}
+	}
+
+	return members, nil
+}
+
+func (a *App) publishGroupMemberEvent(eventName string, groupMember *model.GroupMember) *model.AppError {
+	messageWs := model.NewWebSocketEvent(eventName, "", "", groupMember.UserId, nil, "")
+	groupMemberJSON, jsonErr := json.Marshal(groupMember)
+	if jsonErr != nil {
+		return model.NewAppError("publishGroupMemberEvent", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(jsonErr)
+	}
+	messageWs.Add("group_member", string(groupMemberJSON))
+	a.Publish(messageWs)
 	return nil
 }

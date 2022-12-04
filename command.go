@@ -1,493 +1,812 @@
 // Copyright (c) 2015-present Mattermost, Inc. All Rights Reserved.
 // See LICENSE.txt for license information.
 
-package api4
+package app
 
 import (
-	"encoding/json"
+	"context"
+	"errors"
+	"io"
 	"net/http"
-	"strconv"
+	"net/url"
+	"regexp"
 	"strings"
+	"sync"
+	"unicode"
 
-	"github.com/mattermost/mattermost-server/v6/audit"
+	"github.com/mattermost/mattermost-server/v6/app/request"
 	"github.com/mattermost/mattermost-server/v6/model"
+	"github.com/mattermost/mattermost-server/v6/shared/i18n"
 	"github.com/mattermost/mattermost-server/v6/shared/mlog"
+	"github.com/mattermost/mattermost-server/v6/store"
 )
 
-func (api *API) InitCommand() {
-	api.BaseRoutes.Commands.Handle("", api.APISessionRequired(createCommand)).Methods("POST")
-	api.BaseRoutes.Commands.Handle("", api.APISessionRequired(listCommands)).Methods("GET")
-	api.BaseRoutes.Commands.Handle("/execute", api.APISessionRequired(executeCommand)).Methods("POST")
+const (
+	CmdCustomStatusTrigger = "status"
+	usernameSpecialChars   = ".-_"
+	maxTriggerLen          = 512
+)
 
-	api.BaseRoutes.Command.Handle("", api.APISessionRequired(getCommand)).Methods("GET")
-	api.BaseRoutes.Command.Handle("", api.APISessionRequired(updateCommand)).Methods("PUT")
-	api.BaseRoutes.Command.Handle("/move", api.APISessionRequired(moveCommand)).Methods("PUT")
-	api.BaseRoutes.Command.Handle("", api.APISessionRequired(deleteCommand)).Methods("DELETE")
+var atMentionRegexp = regexp.MustCompile(`\B@[[:alnum:]][[:alnum:]\.\-_:]*`)
 
-	api.BaseRoutes.Team.Handle("/commands/autocomplete", api.APISessionRequired(listAutocompleteCommands)).Methods("GET")
-	api.BaseRoutes.Team.Handle("/commands/autocomplete_suggestions", api.APISessionRequired(listCommandAutocompleteSuggestions)).Methods("GET")
-	api.BaseRoutes.Command.Handle("/regen_token", api.APISessionRequired(regenCommandToken)).Methods("PUT")
+type CommandProvider interface {
+	GetTrigger() string
+	GetCommand(a *App, T i18n.TranslateFunc) *model.Command
+	DoCommand(a *App, c request.CTX, args *model.CommandArgs, message string) *model.CommandResponse
 }
 
-func createCommand(c *Context, w http.ResponseWriter, r *http.Request) {
-	var cmd model.Command
-	if jsonErr := json.NewDecoder(r.Body).Decode(&cmd); jsonErr != nil {
-		c.SetInvalidParamWithErr("command", jsonErr)
-		return
-	}
+var commandProviders = make(map[string]CommandProvider)
 
-	auditRec := c.MakeAuditRecord("createCommand", audit.Fail)
-	auditRec.AddEventParameter("command", cmd)
-	defer c.LogAuditRec(auditRec)
-	c.LogAudit("attempt")
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageSlashCommands) {
-		c.SetPermissionError(model.PermissionManageSlashCommands)
-		return
-	}
-
-	cmd.CreatorId = c.AppContext.Session().UserId
-
-	rcmd, err := c.App.CreateCommand(&cmd)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	c.LogAudit("success")
-	auditRec.AddMeta("command", rcmd)
-	auditRec.AddEventResultState(rcmd)
-	auditRec.AddEventObjectType("command")
-
-	w.WriteHeader(http.StatusCreated)
-	if err := json.NewEncoder(w).Encode(rcmd); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+func RegisterCommandProvider(newProvider CommandProvider) {
+	commandProviders[newProvider.GetTrigger()] = newProvider
 }
 
-func updateCommand(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireCommandId()
-	if c.Err != nil {
-		return
+func GetCommandProvider(name string) CommandProvider {
+	provider, ok := commandProviders[name]
+	if ok {
+		return provider
 	}
 
-	var cmd model.Command
-	if jsonErr := json.NewDecoder(r.Body).Decode(&cmd); jsonErr != nil || cmd.Id != c.Params.CommandId {
-		c.SetInvalidParamWithErr("command", jsonErr)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("updateCommand", audit.Fail)
-	auditRec.AddEventParameter("command", cmd)
-	defer c.LogAuditRec(auditRec)
-	c.LogAudit("attempt")
-
-	oldCmd, err := c.App.GetCommand(c.Params.CommandId)
-	if err != nil {
-		auditRec.AddMeta("command_id", c.Params.CommandId)
-		c.SetCommandNotFoundError()
-		return
-	}
-	auditRec.AddMeta("command", oldCmd)
-
-	if cmd.TeamId != oldCmd.TeamId {
-		c.Err = model.NewAppError("updateCommand", "api.command.team_mismatch.app_error", nil, "user_id="+c.AppContext.Session().UserId, http.StatusBadRequest)
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), oldCmd.TeamId, model.PermissionManageSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		// here we return Not_found instead of a permissions error so we don't leak the existence of
-		// a command to someone without permissions for the team it belongs to.
-		c.SetCommandNotFoundError()
-		return
-	}
-
-	if c.AppContext.Session().UserId != oldCmd.CreatorId && !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), oldCmd.TeamId, model.PermissionManageOthersSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		c.SetPermissionError(model.PermissionManageOthersSlashCommands)
-		return
-	}
-
-	rcmd, err := c.App.UpdateCommand(oldCmd, &cmd)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.AddEventResultState(rcmd)
-	auditRec.AddEventObjectType("command")
-	auditRec.Success()
-	c.LogAudit("success")
-
-	if err := json.NewEncoder(w).Encode(rcmd); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
+	return nil
 }
 
-func moveCommand(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireCommandId()
-	if c.Err != nil {
-		return
+// @openTracingParams teamID, skipSlackParsing
+func (a *App) CreateCommandPost(c request.CTX, post *model.Post, teamID string, response *model.CommandResponse, skipSlackParsing bool) (*model.Post, *model.AppError) {
+	if skipSlackParsing {
+		post.Message = response.Text
+	} else {
+		post.Message = model.ParseSlackLinksToMarkdown(response.Text)
 	}
 
-	var cmr model.CommandMoveRequest
-	if jsonErr := json.NewDecoder(r.Body).Decode(&cmr); jsonErr != nil {
-		c.SetInvalidParamWithErr("team_id", jsonErr)
-		return
+	post.CreateAt = model.GetMillis()
+
+	if strings.HasPrefix(post.Type, model.PostSystemMessagePrefix) {
+		err := model.NewAppError("CreateCommandPost", "api.context.invalid_param.app_error", map[string]any{"Name": "post.type"}, "", http.StatusBadRequest)
+		return nil, err
 	}
 
-	auditRec := c.MakeAuditRecord("moveCommand", audit.Fail)
-	auditRec.AddEventParameter("command_move_request", cmr)
-	defer c.LogAuditRec(auditRec)
-	c.LogAudit("attempt")
-
-	newTeam, appErr := c.App.GetTeam(cmr.TeamId)
-	if appErr != nil {
-		c.Err = appErr
-		return
-	}
-	auditRec.AddMeta("team", newTeam)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), newTeam.Id, model.PermissionManageSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		c.SetPermissionError(model.PermissionManageSlashCommands)
-		return
+	if response.Attachments != nil {
+		model.ParseSlackAttachment(post, response.Attachments)
 	}
 
-	cmd, appErr := c.App.GetCommand(c.Params.CommandId)
-	if appErr != nil {
-		c.SetCommandNotFoundError()
-		return
-	}
-	auditRec.AddMeta("command", cmd)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		// here we return Not_found instead of a permissions error so we don't leak the existence of
-		// a command to someone without permissions for the team it belongs to.
-		c.SetCommandNotFoundError()
-		return
+	if response.ResponseType == model.CommandResponseTypeInChannel {
+		return a.CreatePostMissingChannel(c, post, true)
 	}
 
-	if appErr = c.App.MoveCommand(newTeam, cmd); appErr != nil {
-		c.Err = appErr
-		return
+	if (response.ResponseType == "" || response.ResponseType == model.CommandResponseTypeEphemeral) && (response.Text != "" || response.Attachments != nil) {
+		a.SendEphemeralPost(c, post.UserId, post)
 	}
 
-	auditRec.AddEventResultState(cmd)
-	auditRec.AddEventObjectType("command")
-	auditRec.Success()
-	c.LogAudit("success")
-
-	ReturnStatusOK(w)
+	return post, nil
 }
 
-func deleteCommand(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireCommandId()
-	if c.Err != nil {
-		return
+// @openTracingParams teamID
+// previous ListCommands now ListAutocompleteCommands
+func (a *App) ListAutocompleteCommands(teamID string, T i18n.TranslateFunc) ([]*model.Command, *model.AppError) {
+	commands := make([]*model.Command, 0, 32)
+	seen := make(map[string]bool)
+
+	// Disable custom status slash command if the feature or the setting is off
+	if !*a.Config().TeamSettings.EnableCustomUserStatuses {
+		seen[CmdCustomStatusTrigger] = true
 	}
 
-	auditRec := c.MakeAuditRecord("deleteCommand", audit.Fail)
-	auditRec.AddEventParameter("command_id", c.Params.CommandId)
-	defer c.LogAuditRec(auditRec)
-	c.LogAudit("attempt")
-
-	cmd, err := c.App.GetCommand(c.Params.CommandId)
-	if err != nil {
-		c.SetCommandNotFoundError()
-		return
-	}
-	auditRec.AddMeta("command", cmd)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		// here we return Not_found instead of a permissions error so we don't leak the existence of
-		// a command to someone without permissions for the team it belongs to.
-		c.SetCommandNotFoundError()
-		return
-	}
-
-	if c.AppContext.Session().UserId != cmd.CreatorId && !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageOthersSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		c.SetPermissionError(model.PermissionManageOthersSlashCommands)
-		return
-	}
-
-	err = c.App.DeleteCommand(cmd.Id)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.AddEventResultState(cmd)
-	auditRec.AddEventObjectType("command")
-	auditRec.Success()
-	c.LogAudit("success")
-
-	ReturnStatusOK(w)
-}
-
-func listCommands(c *Context, w http.ResponseWriter, r *http.Request) {
-	customOnly, _ := strconv.ParseBool(r.URL.Query().Get("custom_only"))
-
-	teamId := r.URL.Query().Get("team_id")
-	if teamId == "" {
-		c.SetInvalidParam("team_id")
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), teamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	var commands []*model.Command
-	var err *model.AppError
-	if customOnly {
-		if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), teamId, model.PermissionManageSlashCommands) {
-			c.SetPermissionError(model.PermissionManageSlashCommands)
-			return
+	for _, cmd := range a.PluginCommandsForTeam(teamID) {
+		if cmd.AutoComplete && !seen[cmd.Trigger] {
+			seen[cmd.Trigger] = true
+			commands = append(commands, cmd)
 		}
-		commands, err = c.App.ListTeamCommands(teamId)
+	}
+
+	if *a.Config().ServiceSettings.EnableCommands {
+		teamCmds, err := a.Srv().Store().Command().GetByTeam(teamID)
 		if err != nil {
-			c.Err = err
-			return
+			return nil, model.NewAppError("ListAutocompleteCommands", "app.command.listautocompletecommands.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
 		}
+
+		for _, cmd := range teamCmds {
+			if cmd.AutoComplete && !seen[cmd.Trigger] {
+				cmd.Sanitize()
+				seen[cmd.Trigger] = true
+				commands = append(commands, cmd)
+			}
+		}
+	}
+
+	for _, value := range commandProviders {
+		if cmd := value.GetCommand(a, T); cmd != nil {
+			cpy := *cmd
+			if cpy.AutoComplete && !seen[cpy.Trigger] {
+				cpy.Sanitize()
+				seen[cpy.Trigger] = true
+				commands = append(commands, &cpy)
+			}
+		}
+	}
+
+	return commands, nil
+}
+
+func (a *App) ListTeamCommands(teamID string) ([]*model.Command, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return nil, model.NewAppError("ListTeamCommands", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	teamCmds, err := a.Srv().Store().Command().GetByTeam(teamID)
+	if err != nil {
+		return nil, model.NewAppError("ListTeamCommands", "app.command.listteamcommands.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return teamCmds, nil
+}
+
+func (a *App) ListAllCommands(teamID string, T i18n.TranslateFunc) ([]*model.Command, *model.AppError) {
+	commands := make([]*model.Command, 0, 32)
+	seen := make(map[string]bool)
+	for _, value := range commandProviders {
+		if cmd := value.GetCommand(a, T); cmd != nil {
+			cpy := *cmd
+			if cpy.AutoComplete && !seen[cpy.Trigger] {
+				cpy.Sanitize()
+				seen[cpy.Trigger] = true
+				commands = append(commands, &cpy)
+			}
+		}
+	}
+
+	for _, cmd := range a.PluginCommandsForTeam(teamID) {
+		if !seen[cmd.Trigger] {
+			seen[cmd.Trigger] = true
+			commands = append(commands, cmd)
+		}
+	}
+
+	if *a.Config().ServiceSettings.EnableCommands {
+		teamCmds, err := a.Srv().Store().Command().GetByTeam(teamID)
+		if err != nil {
+			return nil, model.NewAppError("ListAllCommands", "app.command.listallcommands.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+		for _, cmd := range teamCmds {
+			if !seen[cmd.Trigger] {
+				cmd.Sanitize()
+				seen[cmd.Trigger] = true
+				commands = append(commands, cmd)
+			}
+		}
+	}
+
+	return commands, nil
+}
+
+// @openTracingParams args
+func (a *App) ExecuteCommand(c request.CTX, args *model.CommandArgs) (*model.CommandResponse, *model.AppError) {
+	trigger := ""
+	message := ""
+	index := strings.IndexFunc(args.Command, unicode.IsSpace)
+	if index != -1 {
+		trigger = args.Command[:index]
+		message = args.Command[index+1:]
 	} else {
-		//User with no permission should see only system commands
-		if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), teamId, model.PermissionManageSlashCommands) {
-			commands, err = c.App.ListAutocompleteCommands(teamId, c.AppContext.T)
-			if err != nil {
-				c.Err = err
-				return
-			}
-		} else {
-			commands, err = c.App.ListAllCommands(teamId, c.AppContext.T)
-			if err != nil {
-				c.Err = err
-				return
-			}
-		}
+		trigger = args.Command
 	}
-
-	if err := json.NewEncoder(w).Encode(commands); err != nil {
-		c.Logger.Warn("Error writing response", mlog.Err(err))
+	trigger = strings.ToLower(trigger)
+	if !strings.HasPrefix(trigger, "/") {
+		return nil, model.NewAppError("command", "api.command.execute_command.format.app_error", map[string]any{"Trigger": trigger}, "", http.StatusBadRequest)
 	}
-}
+	trigger = strings.TrimPrefix(trigger, "/")
 
-func getCommand(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireCommandId()
-	if c.Err != nil {
-		return
-	}
-
-	cmd, err := c.App.GetCommand(c.Params.CommandId)
-	if err != nil {
-		c.SetCommandNotFoundError()
-		return
-	}
-
-	// check for permissions to view this command; must have perms to view team and
-	// PERMISSION_MANAGE_SLASH_COMMANDS for the team the command belongs to.
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionViewTeam) {
-		// here we return Not_found instead of a permissions error so we don't leak the existence of
-		// a command to someone without permissions for the team it belongs to.
-		c.SetCommandNotFoundError()
-		return
-	}
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageSlashCommands) {
-		// again, return not_found to ensure id existence does not leak.
-		c.SetCommandNotFoundError()
-		return
-	}
-	if err := json.NewEncoder(w).Encode(cmd); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func executeCommand(c *Context, w http.ResponseWriter, r *http.Request) {
-	var commandArgs model.CommandArgs
-	if jsonErr := json.NewDecoder(r.Body).Decode(&commandArgs); jsonErr != nil {
-		c.SetInvalidParamWithErr("command_args", jsonErr)
-		return
-	}
-
-	if len(commandArgs.Command) <= 1 || strings.Index(commandArgs.Command, "/") != 0 || !model.IsValidId(commandArgs.ChannelId) {
-		c.Err = model.NewAppError("executeCommand", "api.command.execute_command.start.app_error", nil, "", http.StatusBadRequest)
-		return
-	}
-
-	auditRec := c.MakeAuditRecord("executeCommand", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	auditRec.AddEventParameter("command_args", commandArgs)
-	auditRec.AddMeta("commandargs", commandArgs)
-
-	// checks that user is a member of the specified channel, and that they have permission to use slash commands in it
-	if !c.App.SessionHasPermissionToChannel(c.AppContext, *c.AppContext.Session(), commandArgs.ChannelId, model.PermissionUseSlashCommands) {
-		c.SetPermissionError(model.PermissionUseSlashCommands)
-		return
-	}
-
-	channel, err := c.App.GetChannel(c.AppContext, commandArgs.ChannelId)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if channel.Type != model.ChannelTypeDirect && channel.Type != model.ChannelTypeGroup {
-		// if this isn't a DM or GM, the team id is implicitly taken from the channel so that slash commands created on
-		// some other team can't be run against this one
-		commandArgs.TeamId = channel.TeamId
-	} else {
-		// if the slash command was used in a DM or GM, ensure that the user is a member of the specified team, so that
-		// they can't just execute slash commands against arbitrary teams
-		if c.AppContext.Session().GetTeamByTeamId(commandArgs.TeamId) == nil {
-			if !c.App.SessionHasPermissionTo(*c.AppContext.Session(), model.PermissionUseSlashCommands) {
-				c.SetPermissionError(model.PermissionUseSlashCommands)
-				return
-			}
-		}
-	}
-
-	commandArgs.UserId = c.AppContext.Session().UserId
-	commandArgs.T = c.AppContext.T
-	commandArgs.SiteURL = c.GetSiteURLHeader()
-	commandArgs.Session = *c.AppContext.Session()
-
-	auditRec.AddMeta("commandargs", commandArgs) // overwrite in case teamid changed. TODO do we need to log this too? is the original commandArgs not enough
-
-	response, err := c.App.ExecuteCommand(c.AppContext, &commandArgs)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	auditRec.Success()
-	if err := json.NewEncoder(w).Encode(response); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func listAutocompleteCommands(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	commands, err := c.App.ListAutocompleteCommands(c.Params.TeamId, c.AppContext.T)
-	if err != nil {
-		c.Err = err
-		return
-	}
-
-	if err := json.NewEncoder(w).Encode(commands); err != nil {
-		c.Logger.Warn("Error while writing response", mlog.Err(err))
-	}
-}
-
-func listCommandAutocompleteSuggestions(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireTeamId()
-	if c.Err != nil {
-		return
-	}
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), c.Params.TeamId, model.PermissionViewTeam) {
-		c.SetPermissionError(model.PermissionViewTeam)
-		return
-	}
-
-	roleId := model.SystemUserRoleId
-	if c.IsSystemAdmin() {
-		roleId = model.SystemAdminRoleId
-	}
-
-	query := r.URL.Query()
-	userInput := query.Get("user_input")
-	if userInput == "" {
-		c.SetInvalidParam("userInput")
-		return
-	}
-	userInput = strings.TrimPrefix(userInput, "/")
-
-	commands, appErr := c.App.ListAutocompleteCommands(c.Params.TeamId, c.AppContext.T)
+	clientTriggerId, triggerId, appErr := model.GenerateTriggerId(args.UserId, a.AsymmetricSigningKey())
 	if appErr != nil {
-		c.Err = appErr
-		return
+		c.Logger().Warn("error occurred in generating trigger Id for a user ", mlog.Err(appErr))
 	}
 
-	commandArgs := &model.CommandArgs{
-		ChannelId: query.Get("channel_id"),
-		TeamId:    c.Params.TeamId,
-		RootId:    query.Get("root_id"),
-		UserId:    c.AppContext.Session().UserId,
-		T:         c.AppContext.T,
-		Session:   *c.AppContext.Session(),
-		SiteURL:   c.GetSiteURLHeader(),
-		Command:   userInput,
+	args.TriggerId = triggerId
+
+	// Plugins can override built in and custom commands
+	cmd, response, appErr := a.tryExecutePluginCommand(c, args)
+	if appErr != nil {
+		return nil, appErr
+	} else if cmd != nil && response != nil {
+		response.TriggerId = clientTriggerId
+		return a.HandleCommandResponse(c, cmd, args, response, true)
 	}
 
-	suggestions := c.App.GetSuggestions(c.AppContext, commandArgs, commands, roleId)
-
-	js, err := json.Marshal(suggestions)
-	if err != nil {
-		c.Err = model.NewAppError("listCommandAutocompleteSuggestions", "api.marshal_error", nil, "", http.StatusInternalServerError).Wrap(err)
-		return
+	// Custom commands can override built ins
+	cmd, response, appErr = a.tryExecuteCustomCommand(c, args, trigger, message)
+	if appErr != nil {
+		return nil, appErr
+	} else if cmd != nil && response != nil {
+		response.TriggerId = clientTriggerId
+		return a.HandleCommandResponse(c, cmd, args, response, false)
 	}
-	w.Write(js)
+
+	cmd, response = a.tryExecuteBuiltInCommand(c, args, trigger, message)
+	if cmd != nil && response != nil {
+		return a.HandleCommandResponse(c, cmd, args, response, true)
+	}
+
+	if len(trigger) > maxTriggerLen {
+		trigger = trigger[:maxTriggerLen]
+		trigger += "..."
+	}
+	return nil, model.NewAppError("command", "api.command.execute_command.not_found.app_error", map[string]any{"Trigger": trigger}, "", http.StatusNotFound)
 }
 
-func regenCommandToken(c *Context, w http.ResponseWriter, r *http.Request) {
-	c.RequireCommandId()
-	if c.Err != nil {
-		return
+// MentionsToTeamMembers returns all the @ mentions found in message that
+// belong to users in the specified team, linking them to their users
+func (a *App) MentionsToTeamMembers(c request.CTX, message, teamID string) model.UserMentionMap {
+	type mentionMapItem struct {
+		Name string
+		Id   string
 	}
 
-	auditRec := c.MakeAuditRecord("regenCommandToken", audit.Fail)
-	defer c.LogAuditRec(auditRec)
-	c.LogAudit("attempt")
+	possibleMentions := possibleAtMentions(message)
+	mentionChan := make(chan *mentionMapItem, len(possibleMentions))
 
-	cmd, err := c.App.GetCommand(c.Params.CommandId)
+	var wg sync.WaitGroup
+	for _, mention := range possibleMentions {
+		wg.Add(1)
+		go func(mention string) {
+			defer wg.Done()
+			user, nErr := a.Srv().Store().User().GetByUsername(mention)
+
+			var nfErr *store.ErrNotFound
+			if nErr != nil && !errors.As(nErr, &nfErr) {
+				c.Logger().Warn("Failed to retrieve user @"+mention, mlog.Err(nErr))
+				return
+			}
+
+			// If it's a http.StatusNotFound error, check for usernames in substrings
+			// without trailing punctuation
+			if nErr != nil {
+				trimmed, ok := trimUsernameSpecialChar(mention)
+				for ; ok; trimmed, ok = trimUsernameSpecialChar(trimmed) {
+					userFromTrimmed, nErr := a.Srv().Store().User().GetByUsername(trimmed)
+					if nErr != nil && !errors.As(nErr, &nfErr) {
+						return
+					}
+
+					if nErr != nil {
+						continue
+					}
+
+					_, err := a.GetTeamMember(teamID, userFromTrimmed.Id)
+					if err != nil {
+						// The user is not in the team, so we should ignore it
+						return
+					}
+
+					mentionChan <- &mentionMapItem{trimmed, userFromTrimmed.Id}
+					return
+				}
+
+				return
+			}
+
+			_, err := a.GetTeamMember(teamID, user.Id)
+			if err != nil {
+				// The user is not in the team, so we should ignore it
+				return
+			}
+
+			mentionChan <- &mentionMapItem{mention, user.Id}
+		}(mention)
+	}
+
+	wg.Wait()
+	close(mentionChan)
+
+	atMentionMap := make(model.UserMentionMap)
+	for mention := range mentionChan {
+		atMentionMap[mention.Name] = mention.Id
+	}
+
+	return atMentionMap
+}
+
+// MentionsToPublicChannels returns all the mentions to public channels,
+// linking them to their channels
+func (a *App) MentionsToPublicChannels(c request.CTX, message, teamID string) model.ChannelMentionMap {
+	type mentionMapItem struct {
+		Name string
+		Id   string
+	}
+
+	channelMentions := model.ChannelMentions(message)
+	mentionChan := make(chan *mentionMapItem, len(channelMentions))
+
+	var wg sync.WaitGroup
+	for _, channelName := range channelMentions {
+		wg.Add(1)
+		go func(channelName string) {
+			defer wg.Done()
+			channel, err := a.GetChannelByName(c, channelName, teamID, false)
+			if err != nil {
+				return
+			}
+
+			if !channel.IsOpen() {
+				return
+			}
+
+			mentionChan <- &mentionMapItem{channelName, channel.Id}
+		}(channelName)
+	}
+
+	wg.Wait()
+	close(mentionChan)
+
+	channelMentionMap := make(model.ChannelMentionMap)
+	for mention := range mentionChan {
+		channelMentionMap[mention.Name] = mention.Id
+	}
+
+	return channelMentionMap
+}
+
+// tryExecuteBuiltInCommand attempts to run a built in command based on the given arguments. If no such command can be
+// found, returns nil for all arguments.
+func (a *App) tryExecuteBuiltInCommand(c request.CTX, args *model.CommandArgs, trigger string, message string) (*model.Command, *model.CommandResponse) {
+	provider := GetCommandProvider(trigger)
+	if provider == nil {
+		return nil, nil
+	}
+
+	cmd := provider.GetCommand(a, args.T)
+	if cmd == nil {
+		return nil, nil
+	}
+
+	return cmd, provider.DoCommand(a, c, args, message)
+}
+
+// tryExecuteCustomCommand attempts to run a custom command based on the given arguments. If no such command can be
+// found, returns nil for all arguments.
+func (a *App) tryExecuteCustomCommand(c request.CTX, args *model.CommandArgs, trigger string, message string) (*model.Command, *model.CommandResponse, *model.AppError) {
+	// Handle custom commands
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return nil, nil, model.NewAppError("ExecuteCommand", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	chanChan := make(chan store.StoreResult, 1)
+	go func() {
+		channel, err := a.Srv().Store().Channel().Get(args.ChannelId, true)
+		chanChan <- store.StoreResult{Data: channel, NErr: err}
+		close(chanChan)
+	}()
+
+	teamChan := make(chan store.StoreResult, 1)
+	go func() {
+		team, err := a.Srv().Store().Team().Get(args.TeamId)
+		teamChan <- store.StoreResult{Data: team, NErr: err}
+		close(teamChan)
+	}()
+
+	userChan := make(chan store.StoreResult, 1)
+	go func() {
+		user, err := a.Srv().Store().User().Get(context.Background(), args.UserId)
+		userChan <- store.StoreResult{Data: user, NErr: err}
+		close(userChan)
+	}()
+
+	teamCmds, err := a.Srv().Store().Command().GetByTeam(args.TeamId)
 	if err != nil {
-		auditRec.AddMeta("command_id", c.Params.CommandId)
-		c.SetCommandNotFoundError()
-		return
-	}
-	auditRec.AddMeta("command", cmd)
-	auditRec.AddEventParameter("command_id", c.Params.CommandId)
-
-	if !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		// here we return Not_found instead of a permissions error so we don't leak the existence of
-		// a command to someone without permissions for the team it belongs to.
-		c.SetCommandNotFoundError()
-		return
+		return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.command.tryexecutecustomcommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	if c.AppContext.Session().UserId != cmd.CreatorId && !c.App.SessionHasPermissionToTeam(*c.AppContext.Session(), cmd.TeamId, model.PermissionManageOthersSlashCommands) {
-		c.LogAudit("fail - inappropriate permissions")
-		c.SetPermissionError(model.PermissionManageOthersSlashCommands)
-		return
+	tr := <-teamChan
+	if tr.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(tr.NErr, &nfErr):
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.team.get.find.app_error", nil, "", http.StatusNotFound).Wrap(tr.NErr)
+		default:
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.team.get.finding.app_error", nil, "", http.StatusInternalServerError).Wrap(tr.NErr)
+		}
+	}
+	team := tr.Data.(*model.Team)
+
+	ur := <-userChan
+	if ur.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(ur.NErr, &nfErr):
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", MissingAccountError, nil, "", http.StatusNotFound).Wrap(ur.NErr)
+		default:
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.user.get.app_error", nil, "", http.StatusInternalServerError).Wrap(ur.NErr)
+		}
+	}
+	user := ur.Data.(*model.User)
+
+	cr := <-chanChan
+	if cr.NErr != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(cr.NErr, &nfErr):
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.channel.get.existing.app_error", nil, "", http.StatusNotFound).Wrap(cr.NErr)
+		default:
+			return nil, nil, model.NewAppError("tryExecuteCustomCommand", "app.channel.get.find.app_error", nil, "", http.StatusInternalServerError).Wrap(cr.NErr)
+		}
+	}
+	channel := cr.Data.(*model.Channel)
+
+	var cmd *model.Command
+
+	for _, teamCmd := range teamCmds {
+		if trigger == teamCmd.Trigger {
+			cmd = teamCmd
+		}
 	}
 
-	rcmd, err := c.App.RegenCommandToken(cmd)
+	if cmd == nil {
+		return nil, nil, nil
+	}
+
+	c.Logger().Debug("Executing command", mlog.String("command", trigger), mlog.String("user_id", args.UserId))
+
+	p := url.Values{}
+	p.Set("token", cmd.Token)
+
+	p.Set("team_id", cmd.TeamId)
+	p.Set("team_domain", team.Name)
+
+	p.Set("channel_id", args.ChannelId)
+	p.Set("channel_name", channel.Name)
+
+	p.Set("user_id", args.UserId)
+	p.Set("user_name", user.Username)
+
+	p.Set("command", "/"+trigger)
+	p.Set("text", message)
+
+	p.Set("trigger_id", args.TriggerId)
+
+	userMentionMap := a.MentionsToTeamMembers(c, message, team.Id)
+	for key, values := range userMentionMap.ToURLValues() {
+		p[key] = values
+	}
+
+	channelMentionMap := a.MentionsToPublicChannels(c, message, team.Id)
+	for key, values := range channelMentionMap.ToURLValues() {
+		p[key] = values
+	}
+
+	hook, appErr := a.CreateCommandWebhook(cmd.Id, args)
+	if appErr != nil {
+		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed.app_error", map[string]any{"Trigger": trigger}, "", http.StatusInternalServerError).Wrap(appErr)
+	}
+	p.Set("response_url", args.SiteURL+"/hooks/commands/"+hook.Id)
+
+	return a.DoCommandRequest(cmd, p)
+}
+
+func (a *App) DoCommandRequest(cmd *model.Command, p url.Values) (*model.Command, *model.CommandResponse, *model.AppError) {
+	// Prepare the request
+	var req *http.Request
+	var err error
+	if cmd.Method == model.CommandMethodGet {
+		req, err = http.NewRequest(http.MethodGet, cmd.URL, nil)
+	} else {
+		req, err = http.NewRequest(http.MethodPost, cmd.URL, strings.NewReader(p.Encode()))
+	}
+
 	if err != nil {
-		c.Err = err
-		return
+		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed.app_error", map[string]any{"Trigger": cmd.Trigger}, "", http.StatusInternalServerError).Wrap(err)
 	}
 
-	auditRec.Success()
-	c.LogAudit("success")
+	if cmd.Method == model.CommandMethodGet {
+		if req.URL.RawQuery != "" {
+			req.URL.RawQuery += "&"
+		}
+		req.URL.RawQuery += p.Encode()
+	}
 
-	resp := make(map[string]string)
-	resp["token"] = rcmd.Token
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Token "+cmd.Token)
+	if cmd.Method == model.CommandMethodPost {
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	}
 
-	w.Write([]byte(model.MapToJSON(resp)))
+	// Send the request
+	resp, err := a.HTTPService().MakeClient(false).Do(req)
+	if err != nil {
+		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed.app_error", map[string]any{"Trigger": cmd.Trigger}, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	defer resp.Body.Close()
+
+	// Handle the response
+	body := io.LimitReader(resp.Body, MaxIntegrationResponseSize)
+
+	if resp.StatusCode != http.StatusOK {
+		// Ignore the error below because the resulting string will just be the empty string if bodyBytes is nil
+		bodyBytes, _ := io.ReadAll(body)
+
+		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed_resp.app_error", map[string]any{"Trigger": cmd.Trigger, "Status": resp.Status}, string(bodyBytes), http.StatusInternalServerError)
+	}
+
+	response, err := model.CommandResponseFromHTTPBody(resp.Header.Get("Content-Type"), body)
+	if err != nil {
+		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed.app_error", map[string]any{"Trigger": cmd.Trigger}, "", http.StatusInternalServerError).Wrap(err)
+	} else if response == nil {
+		return cmd, nil, model.NewAppError("command", "api.command.execute_command.failed_empty.app_error", map[string]any{"Trigger": cmd.Trigger}, "", http.StatusInternalServerError)
+	}
+
+	return cmd, response, nil
+}
+
+func (a *App) HandleCommandResponse(c request.CTX, command *model.Command, args *model.CommandArgs, response *model.CommandResponse, builtIn bool) (*model.CommandResponse, *model.AppError) {
+	trigger := ""
+	if args.Command != "" {
+		parts := strings.Split(args.Command, " ")
+		trigger = parts[0][1:]
+		trigger = strings.ToLower(trigger)
+	}
+
+	var lastError *model.AppError
+	_, err := a.HandleCommandResponsePost(c, command, args, response, builtIn)
+
+	if err != nil {
+		mlog.Debug("Error occurred in handling command response post", mlog.Err(err))
+		lastError = err
+	}
+
+	if response.ExtraResponses != nil {
+		for _, resp := range response.ExtraResponses {
+			_, err := a.HandleCommandResponsePost(c, command, args, resp, builtIn)
+
+			if err != nil {
+				mlog.Debug("Error occurred in handling command response post", mlog.Err(err))
+				lastError = err
+			}
+		}
+	}
+
+	if lastError != nil {
+		return response, model.NewAppError("command", "api.command.execute_command.create_post_failed.app_error", map[string]any{"Trigger": trigger}, "", http.StatusInternalServerError)
+	}
+
+	return response, nil
+}
+
+func (a *App) HandleCommandResponsePost(c request.CTX, command *model.Command, args *model.CommandArgs, response *model.CommandResponse, builtIn bool) (*model.Post, *model.AppError) {
+	post := &model.Post{}
+	post.ChannelId = args.ChannelId
+	post.RootId = args.RootId
+	post.UserId = args.UserId
+	post.Type = response.Type
+	post.SetProps(response.Props)
+
+	if response.ChannelId != "" {
+		_, err := a.GetChannelMember(c, response.ChannelId, args.UserId)
+		if err != nil {
+			err = model.NewAppError("HandleCommandResponsePost", "api.command.command_post.forbidden.app_error", nil, "", http.StatusForbidden).Wrap(err)
+			return nil, err
+		}
+		post.ChannelId = response.ChannelId
+	}
+
+	isBotPost := !builtIn
+
+	if *a.Config().ServiceSettings.EnablePostUsernameOverride {
+		if command.Username != "" {
+			post.AddProp("override_username", command.Username)
+			isBotPost = true
+		} else if response.Username != "" {
+			post.AddProp("override_username", response.Username)
+			isBotPost = true
+		}
+	}
+
+	if *a.Config().ServiceSettings.EnablePostIconOverride {
+		if command.IconURL != "" {
+			post.AddProp("override_icon_url", command.IconURL)
+			isBotPost = true
+		} else if response.IconURL != "" {
+			post.AddProp("override_icon_url", response.IconURL)
+			isBotPost = true
+		} else {
+			post.AddProp("override_icon_url", "")
+		}
+	}
+
+	if isBotPost {
+		post.AddProp("from_webhook", "true")
+	}
+
+	// Process Slack text replacements if the response does not contain "skip_slack_parsing": true.
+	if !response.SkipSlackParsing {
+		response.Text = a.ProcessSlackText(response.Text)
+		response.Attachments = a.ProcessSlackAttachments(response.Attachments)
+	}
+
+	if _, err := a.CreateCommandPost(c, post, args.TeamId, response, response.SkipSlackParsing); err != nil {
+		return post, err
+	}
+
+	return post, nil
+}
+
+func (a *App) CreateCommand(cmd *model.Command) (*model.Command, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return nil, model.NewAppError("CreateCommand", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	return a.createCommand(cmd)
+}
+
+func (a *App) createCommand(cmd *model.Command) (*model.Command, *model.AppError) {
+	cmd.Trigger = strings.ToLower(cmd.Trigger)
+
+	teamCmds, err := a.Srv().Store().Command().GetByTeam(cmd.TeamId)
+	if err != nil {
+		return nil, model.NewAppError("CreateCommand", "app.command.createcommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	for _, existingCommand := range teamCmds {
+		if cmd.Trigger == existingCommand.Trigger {
+			return nil, model.NewAppError("CreateCommand", "api.command.duplicate_trigger.app_error", nil, "", http.StatusBadRequest)
+		}
+	}
+
+	for _, builtInProvider := range commandProviders {
+		builtInCommand := builtInProvider.GetCommand(a, i18n.T)
+		if builtInCommand != nil && cmd.Trigger == builtInCommand.Trigger {
+			return nil, model.NewAppError("CreateCommand", "api.command.duplicate_trigger.app_error", nil, "", http.StatusBadRequest)
+		}
+	}
+
+	command, nErr := a.Srv().Store().Command().Save(cmd)
+	if nErr != nil {
+		var appErr *model.AppError
+		switch {
+		case errors.As(nErr, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("CreateCommand", "app.command.createcommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(nErr)
+		}
+	}
+
+	return command, nil
+}
+
+func (a *App) GetCommand(commandID string) (*model.Command, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return nil, model.NewAppError("GetCommand", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	command, err := a.Srv().Store().Command().Get(commandID)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("SqlCommandStore.Get", "store.sql_command.get.missing.app_error", map[string]any{"command_id": commandID}, "", http.StatusNotFound).Wrap(err)
+		default:
+			return nil, model.NewAppError("GetCommand", "app.command.getcommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+	return command, nil
+}
+
+func (a *App) UpdateCommand(oldCmd, updatedCmd *model.Command) (*model.Command, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return nil, model.NewAppError("UpdateCommand", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	updatedCmd.Trigger = strings.ToLower(updatedCmd.Trigger)
+	updatedCmd.Id = oldCmd.Id
+	updatedCmd.Token = oldCmd.Token
+	updatedCmd.CreateAt = oldCmd.CreateAt
+	updatedCmd.UpdateAt = model.GetMillis()
+	updatedCmd.DeleteAt = oldCmd.DeleteAt
+	updatedCmd.CreatorId = oldCmd.CreatorId
+	updatedCmd.PluginId = oldCmd.PluginId
+	updatedCmd.TeamId = oldCmd.TeamId
+
+	command, err := a.Srv().Store().Command().Update(updatedCmd)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("SqlCommandStore.Update", "store.sql_command.update.missing.app_error", map[string]any{"command_id": updatedCmd.Id}, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("UpdateCommand", "app.command.updatecommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return command, nil
+}
+
+func (a *App) MoveCommand(team *model.Team, command *model.Command) *model.AppError {
+	command.TeamId = team.Id
+
+	_, err := a.Srv().Store().Command().Update(command)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &nfErr):
+			return model.NewAppError("SqlCommandStore.Update", "store.sql_command.update.missing.app_error", map[string]any{"command_id": command.Id}, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &appErr):
+			return appErr
+		default:
+			return model.NewAppError("MoveCommand", "app.command.movecommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return nil
+}
+
+func (a *App) RegenCommandToken(cmd *model.Command) (*model.Command, *model.AppError) {
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return nil, model.NewAppError("RegenCommandToken", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	cmd.Token = model.NewId()
+
+	command, err := a.Srv().Store().Command().Update(cmd)
+	if err != nil {
+		var nfErr *store.ErrNotFound
+		var appErr *model.AppError
+		switch {
+		case errors.As(err, &nfErr):
+			return nil, model.NewAppError("SqlCommandStore.Update", "store.sql_command.update.missing.app_error", map[string]any{"command_id": cmd.Id}, "", http.StatusNotFound).Wrap(err)
+		case errors.As(err, &appErr):
+			return nil, appErr
+		default:
+			return nil, model.NewAppError("RegenCommandToken", "app.command.regencommandtoken.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+		}
+	}
+
+	return command, nil
+}
+
+func (a *App) DeleteCommand(commandID string) *model.AppError {
+	if !*a.Config().ServiceSettings.EnableCommands {
+		return model.NewAppError("DeleteCommand", "api.command.disabled.app_error", nil, "", http.StatusNotImplemented)
+	}
+
+	err := a.Srv().Store().Command().Delete(commandID, model.GetMillis())
+	if err != nil {
+		return model.NewAppError("DeleteCommand", "app.command.deletecommand.internal_error", nil, "", http.StatusInternalServerError).Wrap(err)
+	}
+
+	return nil
+}
+
+// possibleAtMentions returns all substrings in message that look like valid @
+// mentions.
+func possibleAtMentions(message string) []string {
+	var names []string
+
+	if !strings.Contains(message, "@") {
+		return names
+	}
+
+	alreadyMentioned := make(map[string]bool)
+	for _, match := range atMentionRegexp.FindAllString(message, -1) {
+		name := model.NormalizeUsername(match[1:])
+		if !alreadyMentioned[name] && model.IsValidUsernameAllowRemote(name) {
+			names = append(names, name)
+			alreadyMentioned[name] = true
+		}
+	}
+
+	return names
+}
+
+// trimUsernameSpecialChar tries to remove the last character from word if it
+// is a special character for usernames (dot, dash or underscore). If not, it
+// returns the same string.
+func trimUsernameSpecialChar(word string) (string, bool) {
+	len := len(word)
+
+	if len > 0 && strings.LastIndexAny(word, usernameSpecialChars) == (len-1) {
+		return word[:len-1], true
+	}
+
+	return word, false
 }
